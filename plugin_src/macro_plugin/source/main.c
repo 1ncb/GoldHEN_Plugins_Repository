@@ -64,6 +64,26 @@ attr_public u32 g_pluginVersion = 0x00000100; // 1.00
 #define USE_LIGHTBAR         1
 #define BAR_STATE_FILE       "/data/macro_plugin/lightbar_state.txt"
 
+// Popup notifications (top-left of the screen): ready / recording / playing / stopped.
+// Guarded like the light bar: if the game ever crashes inside a notification call, the
+// plugin turns notifications off on the next launch (see notify_state.txt).
+#define USE_NOTIFY           1
+#define NOTIFY_STATE_FILE    "/data/macro_plugin/notify_state.txt"
+#define NOTIFY_TARGET_ID     (-1)           // if no popup ever shows, try 0 here
+#define READY_NOTIFY_AT_READ 300            // "ready" popup after ~5 s of pad reads
+
+// Built-in system icons for now (custom icon is the next experiment)
+#define ICON_READY "cxml://psnotification/tex_default_icon_tips"
+#define ICON_REC   "cxml://psnotification/tex_icon_live_start"
+#define ICON_PLAY  "cxml://psnotification/tex_icon_loading"
+#define ICON_END   "cxml://psnotification/tex_icon_ban"
+
+#define MSG_READY  "Macro ready: tap L1+R2 to record"
+#define MSG_REC    "Macro RECORDING - tap L1+R2 to stop and loop"
+#define MSG_PLAY   "Macro PLAYING (looping) - tap L1+R2 to stop"
+#define MSG_END    "Macro stopped"
+#define MSG_SHORT  "Macro: recording too short, discarded"
+
 // Standard PS4 button bits. To change the combo, edit these two lines.
 #define BTN_L2   0x00000100u
 #define BTN_R2   0x00000200u
@@ -198,6 +218,9 @@ static bool        g_seen_read = false;
 static bool        g_bar_enabled = true;   // false if a previous run crashed in a light bar call
 static bool        g_bar_verified = false; // true after the first successful light bar call this run
 
+static bool        g_notify_enabled = true;   // false if a previous run crashed in a notification call
+static bool        g_notify_verified = false; // true after the first successful notification this run
+
 
 /* ------------------------------------------------------------------ */
 /* Function pointers + hooks (names must match the library functions)  */
@@ -215,30 +238,89 @@ HOOK_INIT(scePadRead);
 /* Light bar                                                           */
 /* ------------------------------------------------------------------ */
 
-static void bar_state_write(char c) {
-    int fd = sceKernelOpen(BAR_STATE_FILE, SCE_KERNEL_O_WRONLY | SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC, 0777);
+static void guard_write(const char *path, char c) {
+    int fd = sceKernelOpen(path, SCE_KERNEL_O_WRONLY | SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC, 0777);
     if (fd < 0) return;
     sceKernelWrite(fd, &c, 1);
     sceKernelClose(fd);
 }
 
-static char bar_state_read(void) {
+static char guard_read(const char *path) {
     char c = 0;
-    int fd = sceKernelOpen(BAR_STATE_FILE, SCE_KERNEL_O_RDONLY, 0);
+    int fd = sceKernelOpen(path, SCE_KERNEL_O_RDONLY, 0);
     if (fd < 0) return 0;
     if (sceKernelRead(fd, &c, 1) != 1) c = 0;
     sceKernelClose(fd);
     return c;
 }
 
+/* ------------------------------------------------------------------ */
+/* Popup notifications                                                 */
+/* ------------------------------------------------------------------ */
+
+// Layout of the system notification request (size 0xC30), as used by the payload SDK.
+typedef struct {
+    int  type;               // 0x00  0 = normal notification
+    int  req_id;             // 0x04
+    int  priority;           // 0x08
+    int  msg_id;             // 0x0C
+    int  target_id;          // 0x10
+    int  user_id;            // 0x14
+    int  unk1;               // 0x18
+    int  unk2;               // 0x1C
+    int  app_id;             // 0x20
+    int  error_num;          // 0x24
+    int  unk3;               // 0x28
+    char use_icon_image_uri; // 0x2C  1 = use icon_uri
+    char message[1024];      // 0x2D
+    char icon_uri[1024];     // 0x42D
+    char unkstr[1024];       // 0x82D
+} NotiReq;
+_Static_assert(sizeof(NotiReq) == 0xC30, "notification struct must be 0xC30 bytes");
+
+static NotiReq g_noti; // static so the 3 KB doesn't sit on the game's pad-thread stack
+static s32 (*p_sendNotification)(s32 device, void *req, size_t size, s32 blocking) = 0;
+
+static void copy_str(char *dst, size_t cap, const char *src) {
+    size_t i = 0;
+    while (src && src[i] && i + 1 < cap) { dst[i] = src[i]; i++; }
+    dst[i] = 0;
+}
+
+static void notify(const char *msg, const char *icon) {
+#if USE_NOTIFY
+    if (!g_notify_enabled || !p_sendNotification) return;
+    memset(&g_noti, 0, sizeof(g_noti));
+    g_noti.type = 0;
+    g_noti.target_id = NOTIFY_TARGET_ID;
+    g_noti.use_icon_image_uri = 1;
+    copy_str(g_noti.message, sizeof(g_noti.message), msg);
+    copy_str(g_noti.icon_uri, sizeof(g_noti.icon_uri), icon);
+
+    if (!g_notify_verified) { guard_write(NOTIFY_STATE_FILE, 'P'); mlog("notify: first call (guarded)"); }
+    s32 rr = p_sendNotification(0, &g_noti, sizeof(g_noti), 0);
+    if (!g_notify_verified) {
+        guard_write(NOTIFY_STATE_FILE, 'K');
+        g_notify_verified = true;
+        mlog_hex("notify: first call OK, returned", (uint32_t)rr);
+    }
+#else
+    (void)msg; (void)icon;
+#endif
+}
+
+/* ------------------------------------------------------------------ */
+/* Light bar                                                           */
+/* ------------------------------------------------------------------ */
+
 static void set_bar(uint8_t r, uint8_t g, uint8_t b) {
 #if USE_LIGHTBAR
     if (!g_bar_enabled || g_handle < 0 || !scePadSetLightBar) return;
     MacroColor c = { r, g, b, 0 };
-    if (!g_bar_verified) { bar_state_write('P'); mlog("light bar: first call (guarded)"); }
+    if (!g_bar_verified) { guard_write(BAR_STATE_FILE, 'P'); mlog("light bar: first call (guarded)"); }
     s32 rr = scePadSetLightBar(g_handle, &c); // direct call, no hook on this function
     if (!g_bar_verified) {
-        bar_state_write('K');
+        guard_write(BAR_STATE_FILE, 'K');
         g_bar_verified = true;
         mlog_hex("light bar: first call OK, returned", (uint32_t)rr);
     }
@@ -360,6 +442,7 @@ static void start_record(uint64_t now) {
     g_t0 = now;
     enter_state(ST_RECORD);
     mlog("STATE: recording started (bar should be red)");
+    notify(MSG_REC, ICON_REC);
 }
 
 static void start_play(uint64_t now) {
@@ -367,6 +450,7 @@ static void start_play(uint64_t now) {
     g_idx = 0;
     enter_state(ST_PLAY);
     mlog("STATE: playing (bar should be green)");
+    notify(MSG_PLAY, ICON_PLAY);
 }
 
 // end_t = moment the stop combo was first pressed, so the combo isn't part of the macro
@@ -376,6 +460,7 @@ static void stop_record_and_play(uint64_t end_t, uint64_t now) {
     mlog_dec("recording ended, duration ms:", dur / 1000);
     if (g_len == 0 || dur < MIN_MACRO_US || dur > 0xFFFFFFFFull) {
         mlog("recording too short or empty, discarded");
+        notify(MSG_SHORT, ICON_END);
         load_macro(); // restore previous macro from disk, if any
         enter_state(ST_IDLE);
         return;
@@ -391,7 +476,7 @@ static void on_tap(uint64_t now) {
     switch (g_state) {
     case ST_IDLE:   start_record(now); break;
     case ST_RECORD: stop_record_and_play(g_combo_press_t, now); break;
-    case ST_PLAY:   enter_state(ST_IDLE); mlog("STATE: stopped"); break;
+    case ST_PLAY:   enter_state(ST_IDLE); mlog("STATE: stopped"); notify(MSG_END, ICON_END); break;
     }
 }
 
@@ -426,6 +511,7 @@ static void process_pad(s32 handle, PadHead *d, int from_read) {
         if (!g_seen_state) { g_seen_state = true; mlog_dec("game uses scePadReadState, handle:", handle); }
     }
     g_total_reads++;
+    if (g_total_reads == READY_NOTIFY_AT_READ) notify(MSG_READY, ICON_READY);
     if (g_total_reads == 600 || g_total_reads == 6000 || g_total_reads == 60000)
         mlog_dec("pad reads so far:", g_total_reads);
 
@@ -497,10 +583,16 @@ s32 attr_public plugin_load(s32 argc, const char* argv[]) {
 
     load_macro();
 
-    if (bar_state_read() == 'P') {
+    if (guard_read(BAR_STATE_FILE) == 'P') {
         g_bar_enabled = false;
         mlog("LIGHT BAR DISABLED: the last run crashed inside a light bar call.");
         mlog("Delete /data/macro_plugin/lightbar_state.txt to try the light bar again.");
+    }
+
+    if (guard_read(NOTIFY_STATE_FILE) == 'P') {
+        g_notify_enabled = false;
+        mlog("NOTIFICATIONS DISABLED: the last run crashed inside a notification call.");
+        mlog("Delete /data/macro_plugin/notify_state.txt to try them again.");
     }
 
     s32 h = 0;
@@ -512,6 +604,19 @@ s32 attr_public plugin_load(s32 argc, const char* argv[]) {
     sys_dynlib_dlsym(h, "scePadSetLightBar", &scePadSetLightBar);
     sys_dynlib_dlsym(h, "scePadResetLightBar", &scePadResetLightBar);
 
+    // notification function lives in libkernel; try the usual module names, then the well-known handle
+    {
+        s32 hk = 0;
+        sys_dynlib_load_prx("libkernel.sprx", &hk);
+        sys_dynlib_dlsym(hk, "sceKernelSendNotificationRequest", &p_sendNotification);
+        if (!p_sendNotification) {
+            sys_dynlib_load_prx("libkernel_sys.sprx", &hk);
+            sys_dynlib_dlsym(hk, "sceKernelSendNotificationRequest", &p_sendNotification);
+        }
+        if (!p_sendNotification) sys_dynlib_dlsym(0x2001, "sceKernelSendNotificationRequest", &p_sendNotification);
+        mlog_hex("found sceKernelSendNotificationRequest at:", (uint64_t)(uintptr_t)p_sendNotification);
+    }
+
     mlog_hex("found scePadReadState at:", (uint64_t)(uintptr_t)scePadReadState);
     mlog_hex("found scePadRead at:", (uint64_t)(uintptr_t)scePadRead);
     mlog_hex("found scePadSetLightBar at (not hooked):", (uint64_t)(uintptr_t)scePadSetLightBar);
@@ -522,6 +627,7 @@ s32 attr_public plugin_load(s32 argc, const char* argv[]) {
 
     mlog("plugin_load finished, waiting for pad reads");
     mlog_dec("light bar feedback enabled:", USE_LIGHTBAR && g_bar_enabled);
+    mlog_dec("notifications enabled:", USE_NOTIFY && g_notify_enabled && p_sendNotification != 0);
     return 0;
 }
 
