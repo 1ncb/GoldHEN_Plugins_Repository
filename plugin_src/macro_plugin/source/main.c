@@ -7,7 +7,10 @@
 //   IDLE + hold combo ~1 s --> play the saved macro without re-recording
 //
 // Timing is timestamp based (microseconds), so playback is independent of game FPS.
-// Saved macro: /data/GoldHEN/macros/macro.bin
+//
+// Files (folder is created automatically):
+//   /data/macro_plugin/log.txt    - plugin log, overwritten each time the plugin loads
+//   /data/macro_plugin/macro.bin  - the saved macro
 
 #include "plugin_common.h"
 #include "Common.h"
@@ -26,8 +29,10 @@
 #if __has_include(<orbis/Pad.h>)
 #include <orbis/Pad.h>
 #define PAD_STRIDE (sizeof(OrbisPadData))
+#define PAD_STRIDE_FALLBACK 0
 #else
-#define PAD_STRIDE 0x80 // fallback guess for sizeof(OrbisPadData); verify if scePadRead misbehaves
+#define PAD_STRIDE 0x80 // fallback guess for sizeof(OrbisPadData)
+#define PAD_STRIDE_FALLBACK 1
 #endif
 #undef scePadReadState
 #undef scePadRead
@@ -43,8 +48,9 @@ attr_public u32 g_pluginVersion = 0x00000100; // 1.00
 /* Config                                                              */
 /* ------------------------------------------------------------------ */
 
-#define MACRO_DIR            "/data/GoldHEN/macros"
-#define MACRO_FILE           "/data/GoldHEN/macros/macro.bin"
+#define PLUGIN_DIR           "/data/macro_plugin"
+#define LOG_FILE             "/data/macro_plugin/log.txt"
+#define MACRO_FILE           "/data/macro_plugin/macro.bin"
 
 #define MAX_SAMPLES          16384          // 16 bytes each = 256 KB
 #define MIN_MACRO_US         200000         // ignore recordings shorter than 0.2 s
@@ -65,12 +71,67 @@ attr_public u32 g_pluginVersion = 0x00000100; // 1.00
 #ifndef SCE_KERNEL_O_WRONLY
 #define SCE_KERNEL_O_WRONLY 0x0001
 #endif
+#ifndef SCE_KERNEL_O_APPEND
+#define SCE_KERNEL_O_APPEND 0x0008
+#endif
 #ifndef SCE_KERNEL_O_CREAT
 #define SCE_KERNEL_O_CREAT  0x0200
 #endif
 #ifndef SCE_KERNEL_O_TRUNC
 #define SCE_KERNEL_O_TRUNC  0x0400
 #endif
+
+/* ------------------------------------------------------------------ */
+/* File logger (no printf-style varargs on purpose)                    */
+/* ------------------------------------------------------------------ */
+
+static size_t put_s(char *b, size_t i, size_t cap, const char *s) {
+    while (s && *s && i + 1 < cap) b[i++] = *s++;
+    return i;
+}
+
+static size_t put_n(char *b, size_t i, size_t cap, uint64_t v, bool hex) {
+    char tmp[24];
+    int n = 0;
+    uint64_t base = hex ? 16 : 10;
+    if (v == 0) tmp[n++] = '0';
+    while (v && n < 23) {
+        uint64_t d = v % base;
+        tmp[n++] = (char)(d < 10 ? '0' + d : 'a' + (d - 10));
+        v /= base;
+    }
+    if (hex) i = put_s(b, i, cap, "0x");
+    while (n && i + 1 < cap) b[i++] = tmp[--n];
+    return i;
+}
+
+static void log_line(const char *msg, bool has_val, uint64_t val, bool hex) {
+    char b[200];
+    size_t i = 0;
+    i = put_s(b, i, sizeof(b), "[");
+    i = put_n(b, i, sizeof(b), sceKernelGetProcessTime() / 1000, false);
+    i = put_s(b, i, sizeof(b), " ms] ");
+    i = put_s(b, i, sizeof(b), msg);
+    if (has_val) {
+        i = put_s(b, i, sizeof(b), " ");
+        i = put_n(b, i, sizeof(b), val, hex);
+    }
+    b[i++] = '\n';
+    int fd = sceKernelOpen(LOG_FILE, SCE_KERNEL_O_WRONLY | SCE_KERNEL_O_CREAT | SCE_KERNEL_O_APPEND, 0777);
+    if (fd < 0) return;
+    sceKernelWrite(fd, b, i);
+    sceKernelClose(fd);
+}
+
+static void log_reset(void) { // create folder, start a fresh log file
+    sceKernelMkdir(PLUGIN_DIR, 0777);
+    int fd = sceKernelOpen(LOG_FILE, SCE_KERNEL_O_WRONLY | SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC, 0777);
+    if (fd >= 0) sceKernelClose(fd);
+}
+
+#define mlog(m)          log_line((m), false, 0, false)
+#define mlog_dec(m, v)   log_line((m), true, (uint64_t)(v), false)
+#define mlog_hex(m, v)   log_line((m), true, (uint64_t)(v), true)
 
 /* ------------------------------------------------------------------ */
 /* Pad data access (stable head of the pad data struct)                */
@@ -124,7 +185,9 @@ static uint64_t    g_combo_press_t = 0;
 
 static s32         g_handle = -1;
 static uint32_t    g_read_count = 0;
-static bool        g_logged_first = false;
+static uint32_t    g_total_reads = 0;
+static bool        g_seen_state = false;
+static bool        g_seen_read = false;
 
 static bool        g_self_call = false;
 static bool        g_have_game_bar = false;
@@ -181,7 +244,7 @@ static void enter_state(MacroState s) {
 static bool load_macro(void) {
     g_have_macro = false;
     int fd = sceKernelOpen(MACRO_FILE, SCE_KERNEL_O_RDONLY, 0);
-    if (fd < 0) return false;
+    if (fd < 0) { mlog("no saved macro file (ok on first run)"); return false; }
 
     MacroHeader h;
     bool ok = false;
@@ -197,19 +260,24 @@ static bool load_macro(void) {
         }
     }
     sceKernelClose(fd);
-    if (ok) final_printf("[macro] loaded %u samples, %u us\n", (unsigned)g_len, (unsigned)g_duration);
+    if (ok) {
+        mlog_dec("loaded macro, samples:", g_len);
+        mlog_dec("loaded macro, duration us:", g_duration);
+    } else {
+        mlog("macro file present but invalid, ignored");
+    }
     return ok;
 }
 
 static void save_macro(void) {
-    sceKernelMkdir(MACRO_DIR, 0777);
+    sceKernelMkdir(PLUGIN_DIR, 0777);
     int fd = sceKernelOpen(MACRO_FILE, SCE_KERNEL_O_WRONLY | SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC, 0777);
-    if (fd < 0) { final_printf("[macro] save failed: open\n"); return; }
+    if (fd < 0) { mlog_hex("SAVE FAILED, open error code:", (uint32_t)fd); return; }
     MacroHeader h = { MACRO_MAGIC, MACRO_VERSION, g_len, g_duration };
     sceKernelWrite(fd, &h, sizeof(h));
     sceKernelWrite(fd, g_buf, g_len * sizeof(MacroSample));
     sceKernelClose(fd);
-    final_printf("[macro] saved %u samples\n", (unsigned)g_len);
+    mlog_dec("saved macro, samples:", g_len);
 }
 
 /* ------------------------------------------------------------------ */
@@ -260,21 +328,23 @@ static void start_record(uint64_t now) {
     g_duration = 0;
     g_t0 = now;
     enter_state(ST_RECORD);
-    final_printf("[macro] recording\n");
+    mlog("STATE: recording started (bar should be red)");
 }
 
 static void start_play(uint64_t now) {
     g_t0 = now;
     g_idx = 0;
     enter_state(ST_PLAY);
-    final_printf("[macro] playing\n");
+    mlog("STATE: playing (bar should be green)");
 }
 
 // end_t = moment the stop combo was first pressed, so the combo isn't part of the macro
 static void stop_record_and_play(uint64_t end_t, uint64_t now) {
     uint64_t dur = (end_t > g_t0) ? (end_t - g_t0) : 0;
+    mlog_dec("recording ended, samples:", g_len);
+    mlog_dec("recording ended, duration ms:", dur / 1000);
     if (g_len == 0 || dur < MIN_MACRO_US || dur > 0xFFFFFFFFull) {
-        final_printf("[macro] recording too short, discarded\n");
+        mlog("recording too short or empty, discarded");
         load_macro(); // restore previous macro from disk, if any
         enter_state(ST_IDLE);
         return;
@@ -286,10 +356,11 @@ static void stop_record_and_play(uint64_t end_t, uint64_t now) {
 }
 
 static void on_tap(uint64_t now) {
+    mlog("combo tapped");
     switch (g_state) {
     case ST_IDLE:   start_record(now); break;
     case ST_RECORD: stop_record_and_play(g_combo_press_t, now); break;
-    case ST_PLAY:   enter_state(ST_IDLE); final_printf("[macro] stopped\n"); break;
+    case ST_PLAY:   enter_state(ST_IDLE); mlog("STATE: stopped"); break;
     }
 }
 
@@ -314,12 +385,19 @@ static void apply_playback(PadHead *d, uint64_t now) {
     write_sample(d, &g_buf[g_idx]);
 }
 
-static void process_pad(s32 handle, PadHead *d) {
+static void process_pad(s32 handle, PadHead *d, int from_read) {
     g_handle = handle;
-    if (!g_logged_first) {
-        g_logged_first = true;
-        final_printf("[macro] pad hook active (handle %d)\n", (int)handle);
+
+    // one-time proof-of-life lines
+    if (from_read) {
+        if (!g_seen_read)  { g_seen_read = true;  mlog_dec("game uses scePadRead, handle:", handle); }
+    } else {
+        if (!g_seen_state) { g_seen_state = true; mlog_dec("game uses scePadReadState, handle:", handle); }
     }
+    g_total_reads++;
+    if (g_total_reads == 600 || g_total_reads == 6000 || g_total_reads == 60000)
+        mlog_dec("pad reads so far:", g_total_reads);
+
     uint64_t now = sceKernelGetProcessTime();
 
     MacroSample real = snapshot(d); // always judge the combo from REAL input
@@ -329,8 +407,10 @@ static void process_pad(s32 handle, PadHead *d) {
         if (!g_combo_prev) {
             g_combo_press_t = now;
             g_combo_consumed = false;
+            mlog("combo pressed (L1+R2 seen)");
         } else if (!g_combo_consumed && g_state == ST_IDLE && g_have_macro &&
                    (now - g_combo_press_t) >= HOLD_PLAY_SAVED_US) {
+            mlog("combo held: playing saved macro");
             start_play(now); // long hold = play saved macro
             g_combo_consumed = true;
         }
@@ -356,7 +436,7 @@ static void process_pad(s32 handle, PadHead *d) {
 
 s32 scePadReadState_hook(s32 handle, void *data) {
     s32 ret = HOOK_CONTINUE(scePadReadState, s32 (*)(s32, void *), handle, data);
-    if (ret == 0 && data) process_pad(handle, (PadHead *)data);
+    if (ret == 0 && data) process_pad(handle, (PadHead *)data, 0);
     return ret;
 }
 
@@ -365,7 +445,7 @@ s32 scePadRead_hook(s32 handle, void *data, s32 count) {
     // scePadRead returns newest-first; process oldest-first to keep state/timing in order
     if (data) {
         uint8_t *base = (uint8_t *)data;
-        for (s32 i = ret - 1; i >= 0; i--) process_pad(handle, (PadHead *)(base + (size_t)i * PAD_STRIDE));
+        for (s32 i = ret - 1; i >= 0; i--) process_pad(handle, (PadHead *)(base + (size_t)i * PAD_STRIDE), 1);
     }
     return ret;
 }
@@ -384,30 +464,41 @@ s32 scePadSetLightBar_hook(s32 handle, const MacroColor *color) {
 /* ------------------------------------------------------------------ */
 
 s32 attr_public plugin_load(s32 argc, const char* argv[]) {
+    log_reset(); // creates /data/macro_plugin and starts a fresh log.txt
+    mlog("=== macro_plugin loaded ===");
+    mlog_hex("plugin version:", g_pluginVersion);
+    mlog_dec("pad data stride:", PAD_STRIDE);
+    if (PAD_STRIDE_FALLBACK) mlog("WARNING: orbis/Pad.h not found, using fallback stride");
+
     final_printf("[GoldHEN] <%s\\Ver.0x%08x> %s\n", g_pluginName, g_pluginVersion, __func__);
-    final_printf("[GoldHEN] Plugin Author(s): %s\n", g_pluginAuth);
     boot_ver();
 
     load_macro();
 
     s32 h = 0;
-    sys_dynlib_load_prx("libScePad.sprx", &h);
+    s32 r = sys_dynlib_load_prx("libScePad.sprx", &h);
+    mlog_hex("load libScePad result:", (uint32_t)r);
+    mlog_hex("libScePad handle:", (uint32_t)h);
     sys_dynlib_dlsym(h, "scePadReadState", &scePadReadState);
     sys_dynlib_dlsym(h, "scePadRead", &scePadRead);
     sys_dynlib_dlsym(h, "scePadSetLightBar", &scePadSetLightBar);
     sys_dynlib_dlsym(h, "scePadResetLightBar", &scePadResetLightBar);
 
-    final_printf("[macro] resolved: ReadState=%p Read=%p SetLightBar=%p\n",
-                 (void *)scePadReadState, (void *)scePadRead, (void *)scePadSetLightBar);
+    mlog_hex("found scePadReadState at:", (uint64_t)(uintptr_t)scePadReadState);
+    mlog_hex("found scePadRead at:", (uint64_t)(uintptr_t)scePadRead);
+    mlog_hex("found scePadSetLightBar at:", (uint64_t)(uintptr_t)scePadSetLightBar);
+    mlog_hex("found scePadResetLightBar at:", (uint64_t)(uintptr_t)scePadResetLightBar);
 
-    if (scePadReadState)   { HOOK32(scePadReadState); }
-    if (scePadRead)        { HOOK32(scePadRead); }
-    if (scePadSetLightBar) { HOOK32(scePadSetLightBar); }
+    if (scePadReadState)   { HOOK32(scePadReadState);   mlog("hooked scePadReadState"); }
+    if (scePadRead)        { HOOK32(scePadRead);        mlog("hooked scePadRead"); }
+    if (scePadSetLightBar) { HOOK32(scePadSetLightBar); mlog("hooked scePadSetLightBar"); }
+
+    mlog("plugin_load finished, waiting for pad reads");
     return 0;
 }
 
 s32 attr_public plugin_unload(s32 argc, const char* argv[]) {
-    final_printf("[GoldHEN] <%s\\Ver.0x%08x> %s\n", g_pluginName, g_pluginVersion, __func__);
+    mlog("plugin_unload");
     g_state = ST_IDLE;
     if (scePadReadState)   { UNHOOK(scePadReadState); }
     if (scePadRead)        { UNHOOK(scePadRead); }
@@ -424,4 +515,3 @@ s32 attr_module_hidden module_stop(s64 argc, const void *args)
 {
     return 0;
 }
-
