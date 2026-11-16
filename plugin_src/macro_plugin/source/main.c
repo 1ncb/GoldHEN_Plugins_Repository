@@ -1,18 +1,21 @@
-// macro_plugin - single-slot controller macro recorder / looper for GoldHEN (PS4)
+// macro_plugin - controller macro recorder / looper for GoldHEN (PS4)
 //
-// Combo = L1 + R2 (hidden from the game; actions fire when you RELEASE the combo)
+// The combo (default L1 + R2) is hidden from the game; actions fire when you RELEASE it.
 //   IDLE      --tap-->  RECORDING   (light bar RED)
-//   RECORDING --tap-->  PLAYING     (light bar GREEN, loops; macro saved to disk)
+//   RECORDING --tap-->  PLAYING     (light bar GREEN, loops; macro saved to the current slot)
 //   PLAYING   --tap-->  IDLE
-//   IDLE + hold combo ~1 s --> play the saved macro without re-recording
+//   IDLE + hold combo ~1 s --> play the saved macro of the current slot
+// While HOLDING the combo:
+//   UP / DOWN       playback speed        LEFT / RIGHT   previous / next macro slot
+//   TRIANGLE        pause / resume        CIRCLE         reload config.json
 //
 // Timing is timestamp based (microseconds), so playback is independent of game FPS.
 //
 // Files (folder is created automatically):
-//   /data/macro_plugin/config.json - settings (combo, light bar colors, popups); a default
-//                                    one is written on first run
-//   /data/macro_plugin/log.txt     - plugin log, overwritten each time the plugin loads
-//   /data/macro_plugin/macro.bin   - the saved macro
+//   /data/macro_plugin/config.json   - settings; a readable default is written on first run
+//   /data/macro_plugin/log.txt       - plugin log, overwritten each time the plugin loads
+//   /data/macro_plugin/macro.bin     - saved macro, slot 1 (slots 2.. are macro_2.bin ...)
+//   /data/macro_plugin/greeting.txt  - remembers that the welcome screen was shown
 
 #include "plugin_common.h"
 #include "Common.h"
@@ -44,38 +47,38 @@
 attr_public const char *g_pluginName = "macro_plugin";
 attr_public const char *g_pluginDesc = "Record and loop controller macros";
 attr_public const char *g_pluginAuth = "you";
-attr_public u32 g_pluginVersion = 0x00000100; // 1.00
+attr_public u32 g_pluginVersion = 0x00000200; // 2.00
 
 /* ------------------------------------------------------------------ */
-/* Config                                                              */
+/* Constants                                                           */
 /* ------------------------------------------------------------------ */
 
 #define PLUGIN_DIR           "/data/macro_plugin"
 #define LOG_FILE             "/data/macro_plugin/log.txt"
-#define MACRO_FILE           "/data/macro_plugin/macro.bin"
+#define MACRO_FILE           "/data/macro_plugin/macro.bin"       // slot 1
 #define CONFIG_FILE          "/data/macro_plugin/config.json"
-#define CFG_MAX              4096           // config.json bigger than this is cut off
+#define CONFIG_BACKUP        "/data/macro_plugin/config_old.json"
+#define GREETING_FILE        "/data/macro_plugin/greeting.txt"
+#define BAR_STATE_FILE       "/data/macro_plugin/lightbar_state.txt"
+#define NOTIFY_STATE_FILE    "/data/macro_plugin/notify_state.txt"
+
+#define CFG_MAX              8192           // config.json bigger than this is cut off
+#define CONFIG_VERSION       2
+#define MAX_SLOTS            8
 
 #define MAX_SAMPLES          16384          // 16 bytes each = 256 KB
 #define MIN_MACRO_US         200000         // ignore recordings shorter than 0.2 s
-#define R2_ANALOG_THRESHOLD  200            // treat R2 as pressed above this (0-255)
+#define MAX_STEP_US          250000         // playback never jumps more than this per pad read
+#define TRIGGER_THRESHOLD    200            // an analog trigger pulled past this counts as pressed (0-255)
 #define BAR_REAPPLY_EVERY    120            // re-apply light bar every N pad reads
 
-// Light bar feedback (red = recording, green = playing).
-// Guarded: if the game ever crashes inside a light bar call, the plugin notices on the
-// next launch and turns the light bar off by itself (see lightbar_state.txt).
 #define USE_LIGHTBAR         1
-#define BAR_STATE_FILE       "/data/macro_plugin/lightbar_state.txt"
-
-// Popup notifications (top-left of the screen): ready / recording / playing / stopped.
-// Guarded like the light bar: if the game ever crashes inside a notification call, the
-// plugin turns notifications off on the next launch (see notify_state.txt).
 #define USE_NOTIFY           1
-#define NOTIFY_STATE_FILE    "/data/macro_plugin/notify_state.txt"
 #define NOTIFY_TARGET_ID     (-1)           // if no popup ever shows, try 0 here
 #define READY_NOTIFY_AT_READ 300            // "ready" popup after ~5 s of pad reads
+#define GREET_AT_READ        600            // welcome screen after ~10 s of pad reads
 
-// Built-in system icons for now (custom icon is the next experiment)
+// Built-in system icons
 #define ICON_READY "cxml://psnotification/tex_default_icon_tips"
 #define ICON_REC   "cxml://psnotification/tex_icon_live_start"
 #define ICON_PLAY  "cxml://psnotification/tex_icon_loading"
@@ -85,9 +88,25 @@ attr_public u32 g_pluginVersion = 0x00000100; // 1.00
 #define MSG_SHORT  "Macro: recording too short, discarded"
 
 // Standard PS4 button bits (the combo itself is chosen in config.json)
-#define BTN_L2   0x00000100u
-#define BTN_R2   0x00000200u
-#define BTN_L1   0x00000400u
+#define BTN_L3       0x00000002u
+#define BTN_R3       0x00000004u
+#define BTN_OPTIONS  0x00000008u
+#define BTN_UP       0x00000010u
+#define BTN_RIGHT    0x00000020u
+#define BTN_DOWN     0x00000040u
+#define BTN_LEFT     0x00000080u
+#define BTN_L2       0x00000100u
+#define BTN_R2       0x00000200u
+#define BTN_L1       0x00000400u
+#define BTN_R1       0x00000800u
+#define BTN_TRIANGLE 0x00001000u
+#define BTN_CIRCLE   0x00002000u
+#define BTN_CROSS    0x00004000u
+#define BTN_SQUARE   0x00008000u
+#define BTN_TOUCHPAD 0x00100000u
+
+// buttons that act as commands while the combo is held
+#define CMD_ALL (BTN_UP | BTN_DOWN | BTN_LEFT | BTN_RIGHT | BTN_TRIANGLE | BTN_CIRCLE)
 
 #ifndef SCE_KERNEL_O_RDONLY
 #define SCE_KERNEL_O_RDONLY 0x0000
@@ -129,11 +148,10 @@ static size_t put_n(char *b, size_t i, size_t cap, uint64_t v, bool hex) {
     while (n && i + 1 < cap) b[i++] = tmp[--n];
     return i;
 }
-
 // >>>PURE-END
 
 static void log_line(const char *msg, bool has_val, uint64_t val, bool hex) {
-    char b[200];
+    char b[240];
     size_t i = 0;
     i = put_s(b, i, sizeof(b), "[");
     i = put_n(b, i, sizeof(b), sceKernelGetProcessTime() / 1000, false);
@@ -168,41 +186,51 @@ static void log_reset(void) { // create folder, start a fresh log file
 typedef struct {
     uint32_t combo_mask;     // buttons that must be held together
     uint32_t hold_play_us;   // hold the combo this long (idle) to play the saved macro
+    uint32_t speed_pct;      // starting playback speed, 100 = normal
+    uint32_t slots;          // number of macro slots (1..MAX_SLOTS)
     bool     bar_on;
     uint8_t  col_rec[3];
     uint8_t  col_play[3];
+    uint8_t  col_pause[3];
     bool     notify_on;
     bool     ready_popup;
     char     icon[128];      // "" = built-in icons; otherwise this URI is used for every popup
+    bool     welcome;        // show the first-run welcome screen
+    int32_t  file_version;   // config_version found in the file (0 = old file without one)
 } Config;
 
 static Config g_cfg;
-static char   g_msg_ready[128];
-static char   g_msg_rec[128];
-static char   g_msg_play[128];
+static char   g_msg_ready[160];
+static char   g_msg_rec[160];
+static char   g_msg_play[160];
 
 static void cfg_defaults(void) {
     memset(&g_cfg, 0, sizeof(g_cfg));
     g_cfg.combo_mask = BTN_L1 | BTN_R2;
     g_cfg.hold_play_us = 1000000;
+    g_cfg.speed_pct = 100;
+    g_cfg.slots = 4;
     g_cfg.bar_on = true;
-    g_cfg.col_rec[0] = 255;  g_cfg.col_rec[1] = 0;    g_cfg.col_rec[2] = 0;
-    g_cfg.col_play[0] = 0;   g_cfg.col_play[1] = 255; g_cfg.col_play[2] = 0;
+    g_cfg.col_rec[0] = 255;   g_cfg.col_rec[1] = 0;     g_cfg.col_rec[2] = 0;
+    g_cfg.col_play[0] = 0;    g_cfg.col_play[1] = 255;  g_cfg.col_play[2] = 0;
+    g_cfg.col_pause[0] = 255; g_cfg.col_pause[1] = 170; g_cfg.col_pause[2] = 0;
     g_cfg.notify_on = true;
     g_cfg.ready_popup = true;
+    g_cfg.welcome = true;
+    g_cfg.file_version = 0;
 }
 
 typedef struct { const char *name; uint32_t bit; } BtnDef;
 // canonical names first; the first name listed for a bit is the one shown in popups
 static const BtnDef g_btns[] = {
-    {"L1", 0x400},   {"L2", 0x100},    {"L3", 0x2},
-    {"R1", 0x800},   {"R2", 0x200},    {"R3", 0x4},
-    {"CROSS", 0x4000}, {"X", 0x4000},
-    {"CIRCLE", 0x2000}, {"O", 0x2000},
-    {"SQUARE", 0x8000}, {"TRIANGLE", 0x1000},
-    {"UP", 0x10},    {"DOWN", 0x40},   {"LEFT", 0x80},  {"RIGHT", 0x20},
-    {"OPTIONS", 0x8},
-    {"TOUCHPAD", 0x100000}, {"TOUCH", 0x100000},
+    {"L1", BTN_L1},   {"L2", BTN_L2},    {"L3", BTN_L3},
+    {"R1", BTN_R1},   {"R2", BTN_R2},    {"R3", BTN_R3},
+    {"CROSS", BTN_CROSS}, {"X", BTN_CROSS},
+    {"CIRCLE", BTN_CIRCLE}, {"O", BTN_CIRCLE},
+    {"SQUARE", BTN_SQUARE}, {"TRIANGLE", BTN_TRIANGLE},
+    {"UP", BTN_UP},   {"DOWN", BTN_DOWN}, {"LEFT", BTN_LEFT}, {"RIGHT", BTN_RIGHT},
+    {"OPTIONS", BTN_OPTIONS},
+    {"TOUCHPAD", BTN_TOUCHPAD}, {"TOUCH", BTN_TOUCHPAD},
 };
 #define N_BTNS (sizeof(g_btns) / sizeof(g_btns[0]))
 
@@ -238,7 +266,7 @@ static void combo_name(uint32_t mask, char *out, size_t cap) {
 }
 
 static void mlog2(const char *a, const char *b) {
-    char buf[200];
+    char buf[220];
     size_t i = 0;
     i = put_s(buf, i, sizeof(buf), a);
     i = put_s(buf, i, sizeof(buf), " ");
@@ -247,20 +275,48 @@ static void mlog2(const char *a, const char *b) {
     mlog(buf);
 }
 
-static void compose3(char *out, size_t cap, const char *a, const char *b, const char *c) {
+// "1", "1.5", "1.25" (force_decimal: "1.0", "1.5", "1.25")
+static void fmt_speed(char *out, size_t cap, uint32_t pct, bool force_decimal) {
+    if (cap == 0) return;
     size_t i = 0;
-    i = put_s(out, i, cap, a);
-    i = put_s(out, i, cap, b);
-    i = put_s(out, i, cap, c);
+    i = put_n(out, i, cap, pct / 100, false);
+    uint32_t rem = pct % 100;
+    if (rem) {
+        char d[3];
+        d[0] = (char)('0' + rem / 10);
+        d[1] = (char)('0' + rem % 10);
+        d[2] = 0;
+        if (d[1] == '0') d[1] = 0;
+        i = put_s(out, i, cap, ".");
+        i = put_s(out, i, cap, d);
+    } else if (force_decimal) {
+        i = put_s(out, i, cap, ".0");
+    }
     out[i] = 0;
 }
 
-static void build_messages(void) {
-    char combo[64];
-    combo_name(g_cfg.combo_mask, combo, sizeof(combo));
-    compose3(g_msg_ready, sizeof(g_msg_ready), "Macro ready: tap ", combo, " to record");
-    compose3(g_msg_rec,   sizeof(g_msg_rec),   "Macro RECORDING - tap ", combo, " to stop and loop");
-    compose3(g_msg_play,  sizeof(g_msg_play),  "Macro PLAYING (looping) - tap ", combo, " to stop");
+// milliseconds -> "8.3"
+static void fmt_tenths(char *out, size_t cap, uint32_t ms) {
+    if (cap == 0) return;
+    uint32_t t = ms / 100;
+    size_t i = 0;
+    i = put_n(out, i, cap, t / 10, false);
+    i = put_s(out, i, cap, ".");
+    i = put_n(out, i, cap, t % 10, false);
+    out[i] = 0;
+}
+
+static const uint16_t g_speed_steps[] = {25, 50, 75, 100, 125, 150, 200, 300, 400};
+#define N_SPEED_STEPS (sizeof(g_speed_steps) / sizeof(g_speed_steps[0]))
+
+static uint32_t speed_up(uint32_t pct) {
+    for (size_t k = 0; k < N_SPEED_STEPS; k++) if (g_speed_steps[k] > pct) return g_speed_steps[k];
+    return pct;
+}
+
+static uint32_t speed_down(uint32_t pct) {
+    for (size_t k = N_SPEED_STEPS; k > 0; k--) if (g_speed_steps[k - 1] < pct) return g_speed_steps[k - 1];
+    return pct;
 }
 
 /* ---- tiny forgiving JSON reader (also allows // and slash-star comments and trailing commas) ---- */
@@ -344,10 +400,15 @@ static bool color_key(const char *path, const char *base, uint8_t *col, int kind
     return false;
 }
 
-static void cfg_leaf(const char *path, int kind, const char *s, int32_t n) {
+// n = whole part of a number, milli = value * 1000 (so 1.25 -> 1250)
+static void cfg_leaf(const char *path, int kind, const char *s, int32_t n, int32_t milli) {
     bool b;
-    if (path[0] == '_') return; // "_help" and friends are comments
+    if (path[0] == '_') return; // keys starting with _ are ignored
 
+    if (path_eq(path, "config_version")) {
+        if (kind == K_NUM) g_cfg.file_version = n;
+        return;
+    }
     if (path_eq(path, "combo") || after_prefix(path, "combo.")) {
         if (kind != K_STR) { mlog2("config: combo entries must be button names in quotes:", path); t_combo_bad = true; return; }
         t_combo_seen = true;
@@ -361,12 +422,28 @@ static void cfg_leaf(const char *path, int kind, const char *s, int32_t n) {
         g_cfg.hold_play_us = (uint32_t)n * 1000u;
         return;
     }
+    if (path_eq(path, "playback.speed")) {
+        if (kind != K_NUM) { mlog2("config: expected a number:", path); return; }
+        int32_t pct = milli / 10;
+        if (pct < 25) pct = 25;
+        if (pct > 400) pct = 400;
+        g_cfg.speed_pct = (uint32_t)pct;
+        return;
+    }
+    if (path_eq(path, "playback.slots")) {
+        if (kind != K_NUM) { mlog2("config: expected a number:", path); return; }
+        if (n < 1) n = 1;
+        if (n > MAX_SLOTS) n = MAX_SLOTS;
+        g_cfg.slots = (uint32_t)n;
+        return;
+    }
     if (path_eq(path, "light_bar.enabled")) {
         if (want_bool(kind, n, &b)) g_cfg.bar_on = b; else mlog2("config: expected true/false:", path);
         return;
     }
     if (color_key(path, "light_bar.recording", g_cfg.col_rec, kind, s, n)) return;
     if (color_key(path, "light_bar.playing", g_cfg.col_play, kind, s, n)) return;
+    if (color_key(path, "light_bar.paused", g_cfg.col_pause, kind, s, n)) return;
     if (path_eq(path, "notifications.enabled")) {
         if (want_bool(kind, n, &b)) g_cfg.notify_on = b; else mlog2("config: expected true/false:", path);
         return;
@@ -381,6 +458,10 @@ static void cfg_leaf(const char *path, int kind, const char *s, int32_t n) {
             while (s[i] && i + 1 < sizeof(g_cfg.icon)) { g_cfg.icon[i] = s[i]; i++; }
             g_cfg.icon[i] = 0;
         } else mlog2("config: icon must be text in quotes:", path);
+        return;
+    }
+    if (path_eq(path, "welcome_screen")) {
+        if (want_bool(kind, n, &b)) g_cfg.welcome = b; else mlog2("config: expected true/false:", path);
         return;
     }
     if (g_unknown_logged < 8) { g_unknown_logged++; mlog2("config: ignoring unknown key:", path); }
@@ -501,23 +582,33 @@ static bool jp_value(JP *j, const char *path, int depth) {
     if (c == '"') {
         char val[160];
         if (!jp_str(j, val, sizeof(val))) return false;
-        cfg_leaf(path, K_STR, val, 0);
+        cfg_leaf(path, K_STR, val, 0, 0);
         return true;
     }
-    if (jp_lit(j, "true"))  { cfg_leaf(path, K_BOOL, 0, 1); return true; }
-    if (jp_lit(j, "false")) { cfg_leaf(path, K_BOOL, 0, 0); return true; }
-    if (jp_lit(j, "null"))  { cfg_leaf(path, K_NULL, 0, 0); return true; }
+    if (jp_lit(j, "true"))  { cfg_leaf(path, K_BOOL, 0, 1, 1000); return true; }
+    if (jp_lit(j, "false")) { cfg_leaf(path, K_BOOL, 0, 0, 0); return true; }
+    if (jp_lit(j, "null"))  { cfg_leaf(path, K_NULL, 0, 0, 0); return true; }
     if (c == '-' || (c >= '0' && c <= '9')) {
         bool neg = (c == '-');
         if (neg) j->p++;
         int32_t v = 0;
         while (j->p < j->end && *j->p >= '0' && *j->p <= '9') {
-            if (v < 100000000) v = v * 10 + (*j->p - '0');
+            if (v < 100000) v = v * 10 + (*j->p - '0');
             j->p++;
         }
-        while (j->p < j->end && (*j->p == '.' || *j->p == 'e' || *j->p == 'E' || *j->p == '+' || *j->p == '-' ||
-                                 (*j->p >= '0' && *j->p <= '9'))) j->p++; // skip fraction/exponent
-        cfg_leaf(path, K_NUM, 0, neg ? -v : v);
+        int32_t frac = 0;
+        if (j->p < j->end && *j->p == '.') { // up to 3 decimal digits
+            j->p++;
+            int32_t scale = 100;
+            while (j->p < j->end && *j->p >= '0' && *j->p <= '9') {
+                if (scale > 0) { frac += (*j->p - '0') * scale; scale /= 10; }
+                j->p++;
+            }
+        }
+        while (j->p < j->end && (*j->p == 'e' || *j->p == 'E' || *j->p == '+' || *j->p == '-' ||
+                                 (*j->p >= '0' && *j->p <= '9'))) j->p++; // skip any exponent
+        int32_t milli = v * 1000 + frac;
+        cfg_leaf(path, K_NUM, 0, neg ? -v : v, neg ? -milli : milli);
         return true;
     }
     return jp_fail(j, "unexpected character (check quotes, commas and brackets)");
@@ -544,67 +635,165 @@ static bool cfg_parse(const char *text, size_t len) {
     }
     return ok;
 }
+
+/* ---- writes the commented config.json text from the current settings ---- */
+
+typedef struct { char *b; size_t i; size_t cap; } W;
+
+static void w_s(W *w, const char *s) { w->i = put_s(w->b, w->i, w->cap, s); }
+static void w_u(W *w, uint32_t v) { w->i = put_n(w->b, w->i, w->cap, v, false); }
+static void w_bool(W *w, bool v) { w_s(w, v ? "true" : "false"); }
+static void w_rgb(W *w, const uint8_t *c) {
+    w_s(w, "["); w_u(w, c[0]); w_s(w, ", "); w_u(w, c[1]); w_s(w, ", "); w_u(w, c[2]); w_s(w, "]");
+}
+static void w_qstr(W *w, const char *s) {
+    w_s(w, "\"");
+    for (; *s; s++) {
+        char t[3] = { 0, 0, 0 };
+        if (*s == '"' || *s == '\\') { t[0] = '\\'; t[1] = *s; } else { t[0] = *s; }
+        w_s(w, t);
+    }
+    w_s(w, "\"");
+}
+
+static size_t cfg_render(char *out, size_t cap) {
+    W w = { out, 0, cap };
+    char sp[16];
+    w_s(&w, "// ============================================================\n");
+    w_s(&w, "//  MACRO PLUGIN SETTINGS\n");
+    w_s(&w, "// ============================================================\n");
+    w_s(&w, "// Lines starting with // are notes, they are ignored.\n");
+    w_s(&w, "// Edit a value, save, then relaunch the game\n");
+    w_s(&w, "// (or hold your combo and press CIRCLE to reload while playing).\n");
+    w_s(&w, "// Keep the quotes, commas and brackets exactly as they are.\n");
+    w_s(&w, "// If something breaks, delete this file and a fresh one is created.\n");
+    w_s(&w, "{\n");
+    w_s(&w, "  \"config_version\": "); w_u(&w, CONFIG_VERSION); w_s(&w, ",\n\n");
+
+    w_s(&w, "  // ---------------- CONTROLS ----------------\n");
+    w_s(&w, "  // The buttons you hold together to control the plugin. Pick 1 to 4 of:\n");
+    w_s(&w, "  //   L1 R1 L2 R2 L3 R3 CROSS CIRCLE SQUARE TRIANGLE UP DOWN LEFT RIGHT OPTIONS TOUCHPAD\n");
+    w_s(&w, "  // Tap the combo: start recording, tap again: loop it, tap again: stop.\n");
+    w_s(&w, "  // Hold the combo for the time below while idle: play the saved macro.\n");
+    w_s(&w, "  // While HOLDING the combo these extra controls work:\n");
+    w_s(&w, "  //   UP / DOWN = playback speed     LEFT / RIGHT = previous / next slot\n");
+    w_s(&w, "  //   TRIANGLE  = pause / resume     CIRCLE       = reload this file\n");
+    w_s(&w, "  // (A button that is part of your combo can't also be one of these controls.)\n");
+    w_s(&w, "  \"combo\": [");
+    {
+        uint32_t shown = 0;
+        bool first = true;
+        for (size_t k = 0; k < N_BTNS; k++) {
+            uint32_t bit = g_btns[k].bit;
+            if ((g_cfg.combo_mask & bit) && !(shown & bit)) {
+                if (!first) w_s(&w, ", ");
+                w_s(&w, "\""); w_s(&w, g_btns[k].name); w_s(&w, "\"");
+                shown |= bit;
+                first = false;
+            }
+        }
+    }
+    w_s(&w, "],\n\n");
+    w_s(&w, "  // How long to hold the combo (in milliseconds, 300 to 10000) to play your saved macro.\n");
+    w_s(&w, "  \"hold_play_ms\": "); w_u(&w, g_cfg.hold_play_us / 1000u); w_s(&w, ",\n\n");
+
+    w_s(&w, "  // ---------------- PLAYBACK ----------------\n");
+    w_s(&w, "  \"playback\": {\n");
+    w_s(&w, "    // Starting speed. 1.0 = normal, 2.0 = double speed, 0.5 = half speed. Range 0.25 to 4.0\n");
+    w_s(&w, "    \"speed\": "); fmt_speed(sp, sizeof(sp), g_cfg.speed_pct, true); w_s(&w, sp); w_s(&w, ",\n\n");
+    w_s(&w, "    // How many macros you can store and switch between (1 to 8).\n");
+    w_s(&w, "    \"slots\": "); w_u(&w, g_cfg.slots); w_s(&w, "\n");
+    w_s(&w, "  },\n\n");
+
+    w_s(&w, "  // ---------------- LIGHT BAR ----------------\n");
+    w_s(&w, "  \"light_bar\": {\n");
+    w_s(&w, "    // true = change the controller light while recording / playing / paused.\n");
+    w_s(&w, "    \"enabled\": "); w_bool(&w, g_cfg.bar_on); w_s(&w, ",\n\n");
+    w_s(&w, "    // Colors are [red, green, blue], each 0 to 255. A hex text like '#FF0000' also works.\n");
+    w_s(&w, "    \"recording\": "); w_rgb(&w, g_cfg.col_rec); w_s(&w, ",\n");
+    w_s(&w, "    \"playing\": "); w_rgb(&w, g_cfg.col_play); w_s(&w, ",\n");
+    w_s(&w, "    \"paused\": "); w_rgb(&w, g_cfg.col_pause); w_s(&w, "\n");
+    w_s(&w, "  },\n\n");
+
+    w_s(&w, "  // ---------------- POPUPS ----------------\n");
+    w_s(&w, "  \"notifications\": {\n");
+    w_s(&w, "    // true = show popup messages (recording started, speed changed, ...).\n");
+    w_s(&w, "    \"enabled\": "); w_bool(&w, g_cfg.notify_on); w_s(&w, ",\n\n");
+    w_s(&w, "    // true = show a 'Macro ready' reminder a few seconds after a game starts.\n");
+    w_s(&w, "    \"ready_popup\": "); w_bool(&w, g_cfg.ready_popup); w_s(&w, ",\n\n");
+    w_s(&w, "    // Experimental and may not work: location of a custom icon. Leave it empty for the built-in icons.\n");
+    w_s(&w, "    \"icon\": "); w_qstr(&w, g_cfg.icon); w_s(&w, "\n");
+    w_s(&w, "  },\n\n");
+
+    w_s(&w, "  // ---------------- WELCOME SCREEN ----------------\n");
+    w_s(&w, "  // true = show the first-run welcome / controls screen once.\n");
+    w_s(&w, "  // To see it again, delete /data/macro_plugin/greeting.txt\n");
+    w_s(&w, "  \"welcome_screen\": "); w_bool(&w, g_cfg.welcome); w_s(&w, "\n");
+    w_s(&w, "}\n");
+    if (cap) w.b[w.i] = 0;
+    return w.i;
+}
 // >>>PURE-END
 
-static const char DEFAULT_CONFIG[] =
-"{\n"
-"  \"_help\": \"combo: 1-4 buttons from L1 R1 L2 R2 L3 R3 CROSS CIRCLE SQUARE TRIANGLE UP DOWN LEFT RIGHT OPTIONS TOUCHPAD. Colors: [red,green,blue] 0-255 or #RRGGBB. icon: leave empty for the built-in icons. Changes apply the next time a game launches.\",\n"
-"  \"combo\": [\"L1\", \"R2\"],\n"
-"  \"hold_play_ms\": 1000,\n"
-"  \"light_bar\": {\n"
-"    \"enabled\": true,\n"
-"    \"recording\": [255, 0, 0],\n"
-"    \"playing\": [0, 255, 0]\n"
-"  },\n"
-"  \"notifications\": {\n"
-"    \"enabled\": true,\n"
-"    \"ready_popup\": true,\n"
-"    \"icon\": \"\"\n"
-"  }\n"
-"}\n";
-
 static char g_cfgbuf[CFG_MAX + 1];
+static char g_render[CFG_MAX];
 
-static void cfg_write_default(void) {
-    sceKernelMkdir(PLUGIN_DIR, 0777);
-    int fd = sceKernelOpen(CONFIG_FILE, SCE_KERNEL_O_WRONLY | SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC, 0777);
-    if (fd < 0) { mlog_hex("config: could not write default config.json, error:", (uint32_t)fd); return; }
-    size_t n = 0;
-    while (DEFAULT_CONFIG[n]) n++;
-    sceKernelWrite(fd, DEFAULT_CONFIG, n);
+static void write_file(const char *path, const void *data, size_t len) {
+    int fd = sceKernelOpen(path, SCE_KERNEL_O_WRONLY | SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC, 0777);
+    if (fd < 0) { mlog2("could not write file:", path); return; }
+    if (len) sceKernelWrite(fd, data, len);
     sceKernelClose(fd);
-    mlog("config: wrote a default config.json");
+}
+
+static void cfg_save_current(void) {
+    sceKernelMkdir(PLUGIN_DIR, 0777);
+    size_t n = cfg_render(g_render, sizeof(g_render));
+    write_file(CONFIG_FILE, g_render, n);
 }
 
 static void cfg_load(void) {
     cfg_defaults();
     int fd = sceKernelOpen(CONFIG_FILE, SCE_KERNEL_O_RDONLY, 0);
     if (fd < 0) {
-        mlog("config: config.json not found, using defaults");
-        cfg_write_default();
+        mlog("config: config.json not found, creating a default one");
+        cfg_save_current();
     } else {
         size_t len = 0;
+        bool truncated = false;
         for (;;) {
-            if (len >= CFG_MAX) { mlog("config: config.json too big, extra text ignored"); break; }
+            if (len >= CFG_MAX) { mlog("config: config.json too big, extra text ignored"); truncated = true; break; }
             int r = sceKernelRead(fd, g_cfgbuf + len, CFG_MAX - len);
             if (r <= 0) break;
             len += (size_t)r;
         }
         sceKernelClose(fd);
         g_cfgbuf[len] = 0;
-        if (cfg_parse(g_cfgbuf, len)) mlog("config: loaded config.json");
-        else mlog("config: problems in config.json, see messages above (settings before the error still apply)");
+        if (cfg_parse(g_cfgbuf, len)) {
+            mlog("config: loaded config.json");
+            if (g_cfg.file_version < CONFIG_VERSION && !truncated) {
+                // old file: keep a backup, then rewrite it in the new readable format with the same values
+                write_file(CONFIG_BACKUP, g_cfgbuf, len);
+                cfg_save_current();
+                mlog("config: upgraded config.json to the new format (old copy: config_old.json)");
+            }
+        } else {
+            mlog("config: problems in config.json, see messages above (settings before the error still apply)");
+        }
     }
 
     char combo[64];
     combo_name(g_cfg.combo_mask, combo, sizeof(combo));
     mlog2("config: combo =", combo);
     mlog_dec("config: hold_play_ms =", g_cfg.hold_play_us / 1000u);
+    mlog_dec("config: start speed percent =", g_cfg.speed_pct);
+    mlog_dec("config: slots =", g_cfg.slots);
     mlog_dec("config: light bar on =", g_cfg.bar_on);
     mlog_hex("config: recording color rgb =", ((uint32_t)g_cfg.col_rec[0] << 16) | ((uint32_t)g_cfg.col_rec[1] << 8) | g_cfg.col_rec[2]);
     mlog_hex("config: playing color rgb =", ((uint32_t)g_cfg.col_play[0] << 16) | ((uint32_t)g_cfg.col_play[1] << 8) | g_cfg.col_play[2]);
+    mlog_hex("config: paused color rgb =", ((uint32_t)g_cfg.col_pause[0] << 16) | ((uint32_t)g_cfg.col_pause[1] << 8) | g_cfg.col_pause[2]);
     mlog_dec("config: popups on =", g_cfg.notify_on);
     mlog_dec("config: ready popup on =", g_cfg.ready_popup);
+    mlog_dec("config: welcome screen on =", g_cfg.welcome);
     if (g_cfg.icon[0]) mlog2("config: custom popup icon:", g_cfg.icon);
 }
 
@@ -651,12 +840,19 @@ static MacroSample g_buf[MAX_SAMPLES];
 static uint32_t    g_len = 0;
 static uint32_t    g_duration = 0;
 static uint32_t    g_idx = 0;
-static uint64_t    g_t0 = 0;
+static uint64_t    g_t0 = 0;               // recording start time
 static bool        g_have_macro = false;
+static uint32_t    g_slot = 1;             // current macro slot, 1-based
+
+static uint32_t    g_speed_pct = 100;      // current playback speed
+static bool        g_paused = false;
+static uint64_t    g_play_pos = 0;         // position inside the macro, microseconds of macro time
+static uint64_t    g_play_last = 0;        // real time of the previous playback step
 
 static bool        g_combo_prev = false;
 static bool        g_combo_consumed = false;
 static uint64_t    g_combo_press_t = 0;
+static uint32_t    g_cmd_prev = 0;         // command buttons held on the previous read
 
 static s32         g_handle = -1;
 static uint32_t    g_read_count = 0;
@@ -666,10 +862,8 @@ static bool        g_seen_read = false;
 
 static bool        g_bar_enabled = true;   // false if a previous run crashed in a light bar call
 static bool        g_bar_verified = false; // true after the first successful light bar call this run
-
-static bool        g_notify_enabled = true;   // false if a previous run crashed in a notification call
-static bool        g_notify_verified = false; // true after the first successful notification this run
-
+static bool        g_notify_enabled = true;
+static bool        g_notify_verified = false;
 
 /* ------------------------------------------------------------------ */
 /* Function pointers + hooks (names must match the library functions)  */
@@ -684,7 +878,7 @@ HOOK_INIT(scePadReadState);
 HOOK_INIT(scePadRead);
 
 /* ------------------------------------------------------------------ */
-/* Light bar                                                           */
+/* Crash guards, popups, light bar                                     */
 /* ------------------------------------------------------------------ */
 
 static void guard_write(const char *path, char c) {
@@ -702,10 +896,6 @@ static char guard_read(const char *path) {
     sceKernelClose(fd);
     return c;
 }
-
-/* ------------------------------------------------------------------ */
-/* Popup notifications                                                 */
-/* ------------------------------------------------------------------ */
 
 // Layout of the system notification request (size 0xC30), as used by the payload SDK.
 typedef struct {
@@ -758,10 +948,6 @@ static void notify(const char *msg, const char *icon) {
 #endif
 }
 
-/* ------------------------------------------------------------------ */
-/* Light bar                                                           */
-/* ------------------------------------------------------------------ */
-
 static void set_bar(uint8_t r, uint8_t g, uint8_t b) {
 #if USE_LIGHTBAR
     if (!g_cfg.bar_on || !g_bar_enabled || g_handle < 0 || !scePadSetLightBar) return;
@@ -781,7 +967,10 @@ static void set_bar(uint8_t r, uint8_t g, uint8_t b) {
 static void apply_state_bar(void) {
     switch (g_state) {
     case ST_RECORD: set_bar(g_cfg.col_rec[0], g_cfg.col_rec[1], g_cfg.col_rec[2]); break;
-    case ST_PLAY:   set_bar(g_cfg.col_play[0], g_cfg.col_play[1], g_cfg.col_play[2]); break;
+    case ST_PLAY:
+        if (g_paused) set_bar(g_cfg.col_pause[0], g_cfg.col_pause[1], g_cfg.col_pause[2]);
+        else          set_bar(g_cfg.col_play[0], g_cfg.col_play[1], g_cfg.col_play[2]);
+        break;
     default:
 #if USE_LIGHTBAR
         if (g_cfg.bar_on && g_bar_enabled && g_bar_verified && g_handle >= 0 && scePadResetLightBar) {
@@ -794,18 +983,71 @@ static void apply_state_bar(void) {
 
 static void enter_state(MacroState s) {
     g_state = s;
+    if (s != ST_PLAY) g_paused = false;
     mlog_dec("enter_state:", (uint32_t)s);
     apply_state_bar();
 }
 
 /* ------------------------------------------------------------------ */
-/* Persistence                                                         */
+/* Popup text that depends on settings                                 */
 /* ------------------------------------------------------------------ */
 
+static char g_pop[200];
+
+static void build_messages(void) {
+    char combo[64], slot[24];
+    combo_name(g_cfg.combo_mask, combo, sizeof(combo));
+    slot[0] = 0;
+    if (g_cfg.slots > 1) {
+        size_t i = 0;
+        i = put_s(slot, i, sizeof(slot), " (slot ");
+        i = put_n(slot, i, sizeof(slot), g_slot, false);
+        i = put_s(slot, i, sizeof(slot), ")");
+        slot[i] = 0;
+    }
+    size_t i = 0;
+    i = put_s(g_msg_ready, 0, sizeof(g_msg_ready), "Macro ready: tap ");
+    i = put_s(g_msg_ready, i, sizeof(g_msg_ready), combo);
+    i = put_s(g_msg_ready, i, sizeof(g_msg_ready), " to record");
+    g_msg_ready[i] = 0;
+    i = put_s(g_msg_rec, 0, sizeof(g_msg_rec), "Macro RECORDING");
+    i = put_s(g_msg_rec, i, sizeof(g_msg_rec), slot);
+    i = put_s(g_msg_rec, i, sizeof(g_msg_rec), " - tap ");
+    i = put_s(g_msg_rec, i, sizeof(g_msg_rec), combo);
+    i = put_s(g_msg_rec, i, sizeof(g_msg_rec), " to stop and loop");
+    g_msg_rec[i] = 0;
+    i = put_s(g_msg_play, 0, sizeof(g_msg_play), "Macro PLAYING");
+    i = put_s(g_msg_play, i, sizeof(g_msg_play), slot);
+    i = put_s(g_msg_play, i, sizeof(g_msg_play), " (looping) - tap ");
+    i = put_s(g_msg_play, i, sizeof(g_msg_play), combo);
+    i = put_s(g_msg_play, i, sizeof(g_msg_play), " to stop");
+    g_msg_play[i] = 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Persistence (one file per slot)                                     */
+/* ------------------------------------------------------------------ */
+
+static void slot_path(uint32_t slot, char *out, size_t cap) {
+    size_t i = 0;
+    if (slot <= 1) {
+        i = put_s(out, 0, cap, MACRO_FILE);
+    } else {
+        i = put_s(out, 0, cap, PLUGIN_DIR "/macro_");
+        i = put_n(out, i, cap, slot, false);
+        i = put_s(out, i, cap, ".bin");
+    }
+    out[i] = 0;
+}
+
 static bool load_macro(void) {
+    char path[96];
+    slot_path(g_slot, path, sizeof(path));
     g_have_macro = false;
-    int fd = sceKernelOpen(MACRO_FILE, SCE_KERNEL_O_RDONLY, 0);
-    if (fd < 0) { mlog("no saved macro file (ok on first run)"); return false; }
+    g_len = 0;
+    g_duration = 0;
+    int fd = sceKernelOpen(path, SCE_KERNEL_O_RDONLY, 0);
+    if (fd < 0) { mlog_dec("no saved macro in slot (ok if never recorded):", g_slot); return false; }
 
     MacroHeader h;
     bool ok = false;
@@ -822,6 +1064,7 @@ static bool load_macro(void) {
     }
     sceKernelClose(fd);
     if (ok) {
+        mlog_dec("loaded macro from slot:", g_slot);
         mlog_dec("loaded macro, samples:", g_len);
         mlog_dec("loaded macro, duration us:", g_duration);
     } else {
@@ -831,13 +1074,16 @@ static bool load_macro(void) {
 }
 
 static void save_macro(void) {
+    char path[96];
+    slot_path(g_slot, path, sizeof(path));
     sceKernelMkdir(PLUGIN_DIR, 0777);
-    int fd = sceKernelOpen(MACRO_FILE, SCE_KERNEL_O_WRONLY | SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC, 0777);
+    int fd = sceKernelOpen(path, SCE_KERNEL_O_WRONLY | SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC, 0777);
     if (fd < 0) { mlog_hex("SAVE FAILED, open error code:", (uint32_t)fd); return; }
     MacroHeader h = { MACRO_MAGIC, MACRO_VERSION, g_len, g_duration };
     sceKernelWrite(fd, &h, sizeof(h));
     sceKernelWrite(fd, g_buf, g_len * sizeof(MacroSample));
     sceKernelClose(fd);
+    mlog_dec("saved macro to slot:", g_slot);
     mlog_dec("saved macro, samples:", g_len);
 }
 
@@ -855,8 +1101,8 @@ static MacroSample snapshot(const PadHead *d) {
     return s;
 }
 
-static void write_sample(PadHead *d, const MacroSample *s) {
-    d->buttons = s->buttons;
+static void write_sample(PadHead *d, const MacroSample *s, uint32_t buttons) {
+    d->buttons = buttons;
     d->lx = s->lx; d->ly = s->ly;
     d->rx = s->rx; d->ry = s->ry;
     d->l2 = s->l2; d->r2 = s->r2;
@@ -871,8 +1117,8 @@ static bool same_state(const MacroSample *a, const MacroSample *b) {
 
 static uint32_t effective_buttons(const MacroSample *s) {
     uint32_t b = s->buttons;
-    if (s->l2 >= R2_ANALOG_THRESHOLD) b |= BTN_L2; // analog trigger pulls count as presses
-    if (s->r2 >= R2_ANALOG_THRESHOLD) b |= BTN_R2;
+    if (s->l2 >= TRIGGER_THRESHOLD) b |= BTN_L2; // analog trigger pulls count as presses
+    if (s->r2 >= TRIGGER_THRESHOLD) b |= BTN_R2;
     return b;
 }
 
@@ -904,8 +1150,10 @@ static void start_record(uint64_t now) {
 }
 
 static void start_play(uint64_t now) {
-    g_t0 = now;
+    g_play_pos = 0;
+    g_play_last = now;
     g_idx = 0;
+    g_paused = false;
     enter_state(ST_PLAY);
     mlog("STATE: playing (bar should be green)");
     notify(g_msg_play, ICON_PLAY);
@@ -919,7 +1167,7 @@ static void stop_record_and_play(uint64_t end_t, uint64_t now) {
     if (g_len == 0 || dur < MIN_MACRO_US || dur > 0xFFFFFFFFull) {
         mlog("recording too short or empty, discarded");
         notify(MSG_SHORT, ICON_END);
-        load_macro(); // restore previous macro from disk, if any
+        load_macro(); // restore the previous macro of this slot from disk, if any
         enter_state(ST_IDLE);
         return;
     }
@@ -946,18 +1194,326 @@ static void record_sample(const MacroSample *real, uint64_t now) {
     g_buf[g_len++] = s;
 }
 
+// Advances the macro by real elapsed time x speed and writes the matching sample into the pad data.
 static void apply_playback(PadHead *d, uint64_t now) {
     if (g_len == 0 || g_duration == 0) { enter_state(ST_IDLE); return; }
 
-    uint64_t el = now - g_t0;
-    if (el >= g_duration) { // loop
-        g_t0 += (el / g_duration) * (uint64_t)g_duration;
-        el = now - g_t0;
-        g_idx = 0;
+    uint64_t dt = now - g_play_last;
+    g_play_last = now;
+    if (g_paused) return; // paused: your real input goes through, the macro waits
+    if (dt > MAX_STEP_US) dt = MAX_STEP_US;
+
+    g_play_pos += dt * g_speed_pct / 100;
+    bool wrapped = false;
+    if (g_play_pos >= g_duration) { g_play_pos %= g_duration; wrapped = true; }
+
+    uint32_t idx = wrapped ? 0 : g_idx;
+    while (idx + 1 < g_len && g_buf[idx + 1].t_us <= g_play_pos) idx++;
+
+    uint32_t buttons = g_buf[idx].buttons;
+    if (g_speed_pct > 100) {
+        // sped up: a very short press could fall between two pad reads, so show every button
+        // that was pressed in the samples we just skipped over
+        uint32_t acc = 0;
+        bool passed = false;
+        if (!wrapped) {
+            for (uint32_t k = g_idx + 1; k <= idx; k++) { acc |= g_buf[k].buttons; passed = true; }
+        } else {
+            for (uint32_t k = g_idx + 1; k < g_len; k++) { acc |= g_buf[k].buttons; passed = true; }
+            for (uint32_t k = 0; k <= idx; k++) { acc |= g_buf[k].buttons; passed = true; }
+        }
+        if (passed) buttons = acc;
     }
-    while (g_idx + 1 < g_len && g_buf[g_idx + 1].t_us <= el) g_idx++;
-    write_sample(d, &g_buf[g_idx]);
+    g_idx = idx;
+    write_sample(d, &g_buf[idx], buttons);
 }
+
+/* ------------------------------------------------------------------ */
+/* Commands while the combo is held                                    */
+/* ------------------------------------------------------------------ */
+
+static void change_speed(int dir) {
+    uint32_t n = dir > 0 ? speed_up(g_speed_pct) : speed_down(g_speed_pct);
+    bool limit = (n == g_speed_pct);
+    g_speed_pct = n;
+    char sp[16];
+    fmt_speed(sp, sizeof(sp), g_speed_pct, false);
+    size_t i = put_s(g_pop, 0, sizeof(g_pop), "Macro speed: ");
+    i = put_s(g_pop, i, sizeof(g_pop), sp);
+    i = put_s(g_pop, i, sizeof(g_pop), "x");
+    if (limit) i = put_s(g_pop, i, sizeof(g_pop), dir > 0 ? " (max)" : " (min)");
+    g_pop[i] = 0;
+    mlog_dec("speed percent now:", g_speed_pct);
+    notify(g_pop, ICON_PLAY);
+}
+
+static void change_slot(int dir, uint64_t now) {
+    if (g_cfg.slots <= 1) {
+        notify("Only 1 macro slot (raise 'slots' in config.json)", ICON_END);
+        return;
+    }
+    bool was_playing = (g_state == ST_PLAY);
+    if (dir > 0) g_slot = (g_slot >= g_cfg.slots) ? 1 : g_slot + 1;
+    else         g_slot = (g_slot <= 1) ? g_cfg.slots : g_slot - 1;
+    if (was_playing) enter_state(ST_IDLE);
+    load_macro();
+    build_messages();
+    mlog_dec("switched to slot:", g_slot);
+
+    if (was_playing && g_have_macro) { start_play(now); return; } // keep playing, now the new macro
+
+    char tmp[16];
+    size_t i = put_s(g_pop, 0, sizeof(g_pop), "Slot ");
+    i = put_n(g_pop, i, sizeof(g_pop), g_slot, false);
+    i = put_s(g_pop, i, sizeof(g_pop), " of ");
+    i = put_n(g_pop, i, sizeof(g_pop), g_cfg.slots, false);
+    i = put_s(g_pop, i, sizeof(g_pop), ": ");
+    if (g_have_macro) {
+        fmt_tenths(tmp, sizeof(tmp), g_duration / 1000u);
+        i = put_s(g_pop, i, sizeof(g_pop), tmp);
+        i = put_s(g_pop, i, sizeof(g_pop), " s");
+    } else {
+        i = put_s(g_pop, i, sizeof(g_pop), "empty");
+    }
+    g_pop[i] = 0;
+    notify(g_pop, ICON_READY);
+}
+
+static void toggle_pause(uint64_t now) {
+    if (g_state != ST_PLAY) { notify("Nothing is playing to pause", ICON_END); return; }
+    g_paused = !g_paused;
+    if (!g_paused) g_play_last = now; // resume from where it stopped
+    apply_state_bar();
+    mlog(g_paused ? "STATE: paused" : "STATE: resumed");
+    notify(g_paused ? "Macro paused - you have control" : "Macro resumed", ICON_PLAY);
+}
+
+static void reload_config(void) {
+    mlog("reloading config.json");
+    cfg_load();
+    g_speed_pct = g_cfg.speed_pct;
+    if (g_slot > g_cfg.slots) { g_slot = 1; load_macro(); }
+    build_messages();
+    apply_state_bar();
+    notify("Macro config reloaded", ICON_READY);
+}
+
+static void handle_commands(uint32_t c) {
+    uint64_t now = sceKernelGetProcessTime();
+    if (g_state == ST_RECORD) { mlog("controls are ignored while recording"); return; }
+    if (c & BTN_UP)       change_speed(+1);
+    if (c & BTN_DOWN)     change_speed(-1);
+    if (c & BTN_LEFT)     change_slot(-1, now);
+    if (c & BTN_RIGHT)    change_slot(+1, now);
+    if (c & BTN_TRIANGLE) toggle_pause(now);
+    if (c & BTN_CIRCLE)   reload_config();
+}
+
+/* ------------------------------------------------------------------ */
+/* First-run welcome screen (system message dialog)                    */
+/* ------------------------------------------------------------------ */
+
+// Layouts of the system message dialog structs, as used by the PS4 SDK.
+typedef struct { size_t size; uint8_t reserved[36]; uint32_t magic; } MD_Base;
+typedef struct { const char *msg1; const char *msg2; uint8_t reserved[32]; } MD_Buttons;
+typedef struct { int32_t buttonType; int32_t pad0; const char *msg; MD_Buttons *buttons; uint8_t reserved[24]; } MD_UserMsg;
+typedef struct {
+    MD_Base base; size_t size; int32_t mode; int32_t pad0;
+    MD_UserMsg *userMsg; void *sysMsg; void *progBar; uint8_t reserved[32]; int32_t pad1;
+} MD_Param;
+typedef struct { int32_t mode; int32_t result; int32_t buttonId; uint8_t reserved[32]; } MD_Result;
+_Static_assert(sizeof(MD_Base) == 0x30, "MD_Base size");
+_Static_assert(sizeof(MD_Buttons) == 0x30, "MD_Buttons size");
+_Static_assert(sizeof(MD_UserMsg) == 0x30, "MD_UserMsg size");
+_Static_assert(sizeof(MD_Param) == 0x80, "MD_Param size");
+
+#define MD_MAGIC            0xC0D1A109u
+#define MD_MODE_USER_MSG    1
+#define MD_BTN_OK           0
+#define MD_BTN_TWO          9
+#define MD_STATUS_FINISHED  3
+#define GREET_LAST_PAGE     4
+
+enum { GR_DONE = 0, GR_PENDING, GR_RUNNING };
+static int      g_gr_stage = GR_DONE;
+static int      g_gr_page = 0;
+static uint32_t g_gr_wait = 0;
+static bool     g_gr_api_ok = false;
+
+static s32 (*p_cdInit)(void) = 0;
+static s32 (*p_mdInit)(void) = 0;
+static s32 (*p_mdOpen)(const void *param) = 0;
+static s32 (*p_mdStatus)(void) = 0;
+static s32 (*p_mdResult)(void *result) = 0;
+static s32 (*p_mdTerm)(void) = 0;
+
+static MD_Param   g_md_param;
+static MD_UserMsg g_md_user;
+static MD_Buttons g_md_btns;
+static uint8_t    g_md_result_buf[128]; // bigger than MD_Result on purpose
+static char       g_gr_text[640];
+
+static void seconds_text(char *out, size_t cap, uint32_t ms) {
+    size_t i = 0;
+    if (ms % 1000 == 0) {
+        i = put_n(out, 0, cap, ms / 1000, false);
+        i = put_s(out, i, cap, ms == 1000 ? " second" : " seconds");
+    } else {
+        char t[16];
+        fmt_tenths(t, sizeof(t), ms);
+        i = put_s(out, 0, cap, t);
+        i = put_s(out, i, cap, " seconds");
+    }
+    out[i] = 0;
+}
+
+static void greet_text(int page) {
+    char c[64], hold[32];
+    combo_name(g_cfg.combo_mask, c, sizeof(c));
+    seconds_text(hold, sizeof(hold), g_cfg.hold_play_us / 1000u);
+    size_t i = 0;
+    char *o = g_gr_text;
+    size_t cap = sizeof(g_gr_text);
+    switch (page) {
+    case 1:
+        i = put_s(o, 0, cap, "Welcome to Macro Plugin!\n\n");
+        i = put_s(o, i, cap, "Record your controller inputs and replay them in a loop, in any game.\n\n");
+        i = put_s(o, i, cap, "Want a quick tour of the controls?");
+        break;
+    case 2:
+        i = put_s(o, 0, cap, "THE BASICS\n\n");
+        i = put_s(o, i, cap, "Tap "); i = put_s(o, i, cap, c); i = put_s(o, i, cap, ": start recording (light bar red).\n");
+        i = put_s(o, i, cap, "Tap it again: stop and loop your macro (green).\n");
+        i = put_s(o, i, cap, "Tap it once more: stop.\n\n");
+        i = put_s(o, i, cap, "Hold "); i = put_s(o, i, cap, c); i = put_s(o, i, cap, " for ");
+        i = put_s(o, i, cap, hold); i = put_s(o, i, cap, ": play your saved macro.");
+        break;
+    case 3:
+        i = put_s(o, 0, cap, "WHILE HOLDING "); i = put_s(o, i, cap, c); i = put_s(o, i, cap, "\n\n");
+        i = put_s(o, i, cap, "UP / DOWN: playback speed\n");
+        i = put_s(o, i, cap, "LEFT / RIGHT: switch macro slot\n");
+        i = put_s(o, i, cap, "TRIANGLE: pause / resume\n");
+        i = put_s(o, i, cap, "CIRCLE: reload config.json\n\n");
+        i = put_s(o, i, cap, "These buttons never reach the game while you hold the combo.");
+        break;
+    default:
+        i = put_s(o, 0, cap, "ALL SET\n\n");
+        i = put_s(o, i, cap, "Settings live in /data/macro_plugin/config.json\n");
+        i = put_s(o, i, cap, "(combo, colors, popups, speed, slots).\n\n");
+        i = put_s(o, i, cap, "Tip: only use macros in offline play.");
+        break;
+    }
+    o[i] = 0;
+}
+
+static bool greet_open(int page) {
+    greet_text(page);
+    memset(&g_md_param, 0, sizeof(g_md_param));
+    memset(&g_md_user, 0, sizeof(g_md_user));
+    memset(&g_md_btns, 0, sizeof(g_md_btns));
+    g_md_param.base.size = sizeof(MD_Base);
+    g_md_param.base.magic = (uint32_t)(MD_MAGIC + (uint64_t)(uintptr_t)&g_md_param.base);
+    g_md_param.size = sizeof(MD_Param);
+    g_md_param.mode = MD_MODE_USER_MSG;
+    g_md_param.userMsg = &g_md_user;
+    g_md_user.msg = g_gr_text;
+    if (page >= GREET_LAST_PAGE) {
+        g_md_user.buttonType = MD_BTN_OK;
+    } else {
+        g_md_user.buttonType = MD_BTN_TWO;
+        g_md_user.buttons = &g_md_btns;
+        g_md_btns.msg1 = (page == 1) ? "Yes" : "Next";
+        g_md_btns.msg2 = (page == 1) ? "Skip" : "Done";
+    }
+    s32 r = p_mdInit();
+    mlog_hex("welcome: dialog init returned", (uint32_t)r);
+    if (r < 0) return false;
+    r = p_mdOpen(&g_md_param);
+    mlog_hex("welcome: dialog open returned", (uint32_t)r);
+    if (r < 0) { p_mdTerm(); return false; }
+    mlog_dec("welcome: showing page", page);
+    return true;
+}
+
+static void greet_finish(void) {
+    g_gr_stage = GR_DONE;
+    guard_write(GREETING_FILE, 'D');
+    mlog("welcome: finished");
+}
+
+// Fallback if the dialog can't be used: the same info as three popups
+static void greet_fallback(void) {
+    char c[64];
+    combo_name(g_cfg.combo_mask, c, sizeof(c));
+    size_t i = put_s(g_pop, 0, sizeof(g_pop), "Macro Plugin: tap ");
+    i = put_s(g_pop, i, sizeof(g_pop), c);
+    i = put_s(g_pop, i, sizeof(g_pop), " to record, again to loop, again to stop.");
+    g_pop[i] = 0;
+    notify(g_pop, ICON_READY);
+    i = put_s(g_pop, 0, sizeof(g_pop), "Hold ");
+    i = put_s(g_pop, i, sizeof(g_pop), c);
+    i = put_s(g_pop, i, sizeof(g_pop), " to play your saved macro. While holding: UP/DOWN speed, LEFT/RIGHT slot.");
+    g_pop[i] = 0;
+    notify(g_pop, ICON_READY);
+    i = put_s(g_pop, 0, sizeof(g_pop), "While holding ");
+    i = put_s(g_pop, i, sizeof(g_pop), c);
+    i = put_s(g_pop, i, sizeof(g_pop), ": TRIANGLE pause, CIRCLE reload. Settings: /data/macro_plugin/config.json");
+    g_pop[i] = 0;
+    notify(g_pop, ICON_READY);
+    greet_finish();
+}
+
+static void greet_begin(void) {
+    guard_write(GREETING_FILE, 'P'); // if the game dies while the dialog is up, we never show it again
+    if (!g_gr_api_ok) {
+        mlog("welcome: dialog functions not available, using popups instead");
+        greet_fallback();
+        return;
+    }
+    if (p_cdInit) p_cdInit();
+    g_gr_stage = GR_RUNNING;
+    g_gr_page = 1;
+    g_gr_wait = 0;
+    if (!greet_open(1)) {
+        mlog("welcome: could not open the dialog, using popups instead");
+        greet_fallback();
+    }
+}
+
+static void greet_collect(void) {
+    memset(g_md_result_buf, 0, sizeof(g_md_result_buf));
+    MD_Result *res = (MD_Result *)g_md_result_buf;
+    s32 rr = p_mdResult(res);
+    p_mdTerm();
+    bool ok = (rr == 0 && res->result == 0);
+    mlog_dec("welcome: page answered:", g_gr_page);
+    mlog_dec("welcome: button id:", (uint32_t)res->buttonId);
+    if (ok && res->buttonId == 1 && g_gr_page < GREET_LAST_PAGE) {
+        g_gr_page++;
+        g_gr_wait = 20; // give the system a moment before the next page
+    } else {
+        greet_finish();
+    }
+}
+
+static void greet_tick(void) {
+    if (g_gr_stage == GR_PENDING) {
+        if (g_total_reads >= GREET_AT_READ && g_state == ST_IDLE) greet_begin();
+        return;
+    }
+    if (g_gr_stage != GR_RUNNING) return;
+    if (g_gr_wait) {
+        if (--g_gr_wait == 0 && !greet_open(g_gr_page)) { mlog("welcome: next page failed, stopping"); greet_finish(); }
+        return;
+    }
+    s32 st = p_mdStatus();
+    if (st == MD_STATUS_FINISHED) greet_collect();
+    else if (st < 0) { mlog_hex("welcome: dialog status error", (uint32_t)st); greet_finish(); }
+}
+
+/* ------------------------------------------------------------------ */
+/* Per-read processing                                                 */
+/* ------------------------------------------------------------------ */
 
 static void process_pad(s32 handle, PadHead *d, int from_read) {
     g_handle = handle;
@@ -969,32 +1525,51 @@ static void process_pad(s32 handle, PadHead *d, int from_read) {
         if (!g_seen_state) { g_seen_state = true; mlog_dec("game uses scePadReadState, handle:", handle); }
     }
     g_total_reads++;
-    if (g_cfg.ready_popup && g_total_reads == READY_NOTIFY_AT_READ) notify(g_msg_ready, ICON_READY);
     if (g_total_reads == 600 || g_total_reads == 6000 || g_total_reads == 60000)
         mlog_dec("pad reads so far:", g_total_reads);
+
+    // the welcome screen takes over while it is showing
+    if (g_gr_stage != GR_DONE) {
+        greet_tick();
+        if (g_gr_stage == GR_RUNNING) return;
+    }
+    if (g_cfg.ready_popup && g_gr_stage == GR_DONE && g_total_reads == READY_NOTIFY_AT_READ)
+        notify(g_msg_ready, ICON_READY);
 
     uint64_t now = sceKernelGetProcessTime();
 
     MacroSample real = snapshot(d); // always judge the combo from REAL input
     bool combo = combo_down(&real);
 
+    uint32_t cmd_mask = CMD_ALL & ~g_cfg.combo_mask;
+    uint32_t cmd_now = effective_buttons(&real) & cmd_mask;
+    uint32_t cmd_new = cmd_now & ~g_cmd_prev; // command buttons pressed since the last read
+    g_cmd_prev = cmd_now;
+
     if (combo) {
         if (!g_combo_prev) {
             g_combo_press_t = now;
             g_combo_consumed = false;
-            mlog("combo pressed (L1+R2 seen)");
+            mlog("combo pressed");
         } else if (!g_combo_consumed && g_state == ST_IDLE && g_have_macro &&
                    (now - g_combo_press_t) >= g_cfg.hold_play_us) {
             mlog("combo held: playing saved macro");
             start_play(now); // long hold = play saved macro
             g_combo_consumed = true;
         }
+        if (cmd_new) {
+            g_combo_consumed = true; // using a control means this was not a tap
+            handle_commands(cmd_new);
+        }
     } else if (g_combo_prev && !g_combo_consumed) {
         on_tap(now); // tap = acted on release
     }
     g_combo_prev = combo;
 
-    if (combo) strip_combo(d);
+    if (combo) {
+        strip_combo(d);
+        d->buttons &= ~cmd_mask; // the control buttons never reach the game while the combo is held
+    }
 
     if (g_state == ST_RECORD) {
         if (!combo) record_sample(&real, now);
@@ -1039,21 +1614,35 @@ s32 attr_public plugin_load(s32 argc, const char* argv[]) {
     final_printf("[GoldHEN] <%s\\Ver.0x%08x> %s\n", g_pluginName, g_pluginVersion, __func__);
     boot_ver();
 
-    cfg_load();       // read /data/macro_plugin/config.json (writes a default one if missing)
-    build_messages(); // popup text that mentions your combo
-
+    cfg_load();       // read /data/macro_plugin/config.json (creates / upgrades it when needed)
+    g_speed_pct = g_cfg.speed_pct;
+    g_slot = 1;
     load_macro();
+    build_messages(); // popup text that mentions your combo
 
     if (guard_read(BAR_STATE_FILE) == 'P') {
         g_bar_enabled = false;
         mlog("LIGHT BAR DISABLED: the last run crashed inside a light bar call.");
         mlog("Delete /data/macro_plugin/lightbar_state.txt to try the light bar again.");
     }
-
     if (guard_read(NOTIFY_STATE_FILE) == 'P') {
         g_notify_enabled = false;
         mlog("NOTIFICATIONS DISABLED: the last run crashed inside a notification call.");
         mlog("Delete /data/macro_plugin/notify_state.txt to try them again.");
+    }
+
+    char gs = guard_read(GREETING_FILE);
+    if (!g_cfg.welcome) {
+        g_gr_stage = GR_DONE;
+    } else if (gs == 'D') {
+        g_gr_stage = GR_DONE;
+    } else if (gs == 'P') {
+        g_gr_stage = GR_DONE;
+        mlog("welcome: the last attempt did not finish, not showing it again.");
+        mlog("Delete /data/macro_plugin/greeting.txt to see the welcome screen again.");
+    } else {
+        g_gr_stage = GR_PENDING;
+        mlog("welcome: first run, will show the welcome screen shortly");
     }
 
     s32 h = 0;
@@ -1078,6 +1667,21 @@ s32 attr_public plugin_load(s32 argc, const char* argv[]) {
         mlog_hex("found sceKernelSendNotificationRequest at:", (uint64_t)(uintptr_t)p_sendNotification);
     }
 
+    // system message dialog (welcome screen)
+    if (g_gr_stage == GR_PENDING) {
+        s32 hc = 0, hm = 0;
+        sys_dynlib_load_prx("libSceCommonDialog.sprx", &hc);
+        sys_dynlib_load_prx("libSceMsgDialog.sprx", &hm);
+        sys_dynlib_dlsym(hc, "sceCommonDialogInitialize", &p_cdInit);
+        sys_dynlib_dlsym(hm, "sceMsgDialogInitialize", &p_mdInit);
+        sys_dynlib_dlsym(hm, "sceMsgDialogOpen", &p_mdOpen);
+        sys_dynlib_dlsym(hm, "sceMsgDialogUpdateStatus", &p_mdStatus);
+        sys_dynlib_dlsym(hm, "sceMsgDialogGetResult", &p_mdResult);
+        sys_dynlib_dlsym(hm, "sceMsgDialogTerminate", &p_mdTerm);
+        g_gr_api_ok = p_mdInit && p_mdOpen && p_mdStatus && p_mdResult && p_mdTerm;
+        mlog_dec("welcome: dialog functions found:", g_gr_api_ok);
+    }
+
     mlog_hex("found scePadReadState at:", (uint64_t)(uintptr_t)scePadReadState);
     mlog_hex("found scePadRead at:", (uint64_t)(uintptr_t)scePadRead);
     mlog_hex("found scePadSetLightBar at (not hooked):", (uint64_t)(uintptr_t)scePadSetLightBar);
@@ -1087,8 +1691,8 @@ s32 attr_public plugin_load(s32 argc, const char* argv[]) {
     if (scePadRead)        { HOOK32(scePadRead);        mlog("hooked scePadRead"); }
 
     mlog("plugin_load finished, waiting for pad reads");
-    mlog_dec("light bar feedback enabled:", USE_LIGHTBAR && g_bar_enabled);
-    mlog_dec("notifications enabled:", USE_NOTIFY && g_notify_enabled && p_sendNotification != 0);
+    mlog_dec("light bar feedback enabled:", USE_LIGHTBAR && g_bar_enabled && g_cfg.bar_on);
+    mlog_dec("notifications enabled:", USE_NOTIFY && g_notify_enabled && g_cfg.notify_on && p_sendNotification != 0);
     return 0;
 }
 
