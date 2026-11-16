@@ -58,9 +58,11 @@ attr_public u32 g_pluginVersion = 0x00000100; // 1.00
 #define R2_ANALOG_THRESHOLD  200            // treat R2 as pressed above this (0-255)
 #define BAR_REAPPLY_EVERY    120            // re-apply light bar every N pad reads
 
-// Light bar feedback (red = recording, green = playing). OFF while we debug: calling
-// scePadSetLightBar crashed the game on the first test. Set to 1 to try it again.
-#define USE_LIGHTBAR         0
+// Light bar feedback (red = recording, green = playing).
+// Guarded: if the game ever crashes inside a light bar call, the plugin notices on the
+// next launch and turns the light bar off by itself (see lightbar_state.txt).
+#define USE_LIGHTBAR         1
+#define BAR_STATE_FILE       "/data/macro_plugin/lightbar_state.txt"
 
 // Standard PS4 button bits. To change the combo, edit these two lines.
 #define BTN_L2   0x00000100u
@@ -193,6 +195,9 @@ static uint32_t    g_total_reads = 0;
 static bool        g_seen_state = false;
 static bool        g_seen_read = false;
 
+static bool        g_bar_enabled = true;   // false if a previous run crashed in a light bar call
+static bool        g_bar_verified = false; // true after the first successful light bar call this run
+
 
 /* ------------------------------------------------------------------ */
 /* Function pointers + hooks (names must match the library functions)  */
@@ -210,13 +215,33 @@ HOOK_INIT(scePadRead);
 /* Light bar                                                           */
 /* ------------------------------------------------------------------ */
 
+static void bar_state_write(char c) {
+    int fd = sceKernelOpen(BAR_STATE_FILE, SCE_KERNEL_O_WRONLY | SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC, 0777);
+    if (fd < 0) return;
+    sceKernelWrite(fd, &c, 1);
+    sceKernelClose(fd);
+}
+
+static char bar_state_read(void) {
+    char c = 0;
+    int fd = sceKernelOpen(BAR_STATE_FILE, SCE_KERNEL_O_RDONLY, 0);
+    if (fd < 0) return 0;
+    if (sceKernelRead(fd, &c, 1) != 1) c = 0;
+    sceKernelClose(fd);
+    return c;
+}
+
 static void set_bar(uint8_t r, uint8_t g, uint8_t b) {
 #if USE_LIGHTBAR
-    if (g_handle < 0 || !scePadSetLightBar) return;
+    if (!g_bar_enabled || g_handle < 0 || !scePadSetLightBar) return;
     MacroColor c = { r, g, b, 0 };
-    mlog("light bar: calling scePadSetLightBar");
+    if (!g_bar_verified) { bar_state_write('P'); mlog("light bar: first call (guarded)"); }
     s32 rr = scePadSetLightBar(g_handle, &c); // direct call, no hook on this function
-    mlog_hex("light bar: returned", (uint32_t)rr);
+    if (!g_bar_verified) {
+        bar_state_write('K');
+        g_bar_verified = true;
+        mlog_hex("light bar: first call OK, returned", (uint32_t)rr);
+    }
 #else
     (void)r; (void)g; (void)b;
 #endif
@@ -228,10 +253,8 @@ static void apply_state_bar(void) {
     case ST_PLAY:   set_bar(0, 255, 0); break;
     default:
 #if USE_LIGHTBAR
-        if (g_handle >= 0 && scePadResetLightBar) {
-            mlog("light bar: calling scePadResetLightBar");
-            s32 rr = scePadResetLightBar(g_handle);
-            mlog_hex("light bar: returned", (uint32_t)rr);
+        if (g_bar_enabled && g_bar_verified && g_handle >= 0 && scePadResetLightBar) {
+            scePadResetLightBar(g_handle); // back to the controller's normal color
         }
 #endif
         break;
@@ -474,6 +497,12 @@ s32 attr_public plugin_load(s32 argc, const char* argv[]) {
 
     load_macro();
 
+    if (bar_state_read() == 'P') {
+        g_bar_enabled = false;
+        mlog("LIGHT BAR DISABLED: the last run crashed inside a light bar call.");
+        mlog("Delete /data/macro_plugin/lightbar_state.txt to try the light bar again.");
+    }
+
     s32 h = 0;
     s32 r = sys_dynlib_load_prx("libScePad.sprx", &h);
     mlog_hex("load libScePad result:", (uint32_t)r);
@@ -492,7 +521,7 @@ s32 attr_public plugin_load(s32 argc, const char* argv[]) {
     if (scePadRead)        { HOOK32(scePadRead);        mlog("hooked scePadRead"); }
 
     mlog("plugin_load finished, waiting for pad reads");
-    mlog_dec("light bar feedback enabled:", USE_LIGHTBAR);
+    mlog_dec("light bar feedback enabled:", USE_LIGHTBAR && g_bar_enabled);
     return 0;
 }
 
