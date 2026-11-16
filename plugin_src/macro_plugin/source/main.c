@@ -58,6 +58,10 @@ attr_public u32 g_pluginVersion = 0x00000100; // 1.00
 #define R2_ANALOG_THRESHOLD  200            // treat R2 as pressed above this (0-255)
 #define BAR_REAPPLY_EVERY    120            // re-apply light bar every N pad reads
 
+// Light bar feedback (red = recording, green = playing). OFF while we debug: calling
+// scePadSetLightBar crashed the game on the first test. Set to 1 to try it again.
+#define USE_LIGHTBAR         0
+
 // Standard PS4 button bits. To change the combo, edit these two lines.
 #define BTN_L2   0x00000100u
 #define BTN_R2   0x00000200u
@@ -189,9 +193,6 @@ static uint32_t    g_total_reads = 0;
 static bool        g_seen_state = false;
 static bool        g_seen_read = false;
 
-static bool        g_self_call = false;
-static bool        g_have_game_bar = false;
-static MacroColor  g_game_bar;
 
 /* ------------------------------------------------------------------ */
 /* Function pointers + hooks (names must match the library functions)  */
@@ -204,18 +205,21 @@ s32 (*scePadResetLightBar)(s32 handle);
 
 HOOK_INIT(scePadReadState);
 HOOK_INIT(scePadRead);
-HOOK_INIT(scePadSetLightBar);
 
 /* ------------------------------------------------------------------ */
 /* Light bar                                                           */
 /* ------------------------------------------------------------------ */
 
 static void set_bar(uint8_t r, uint8_t g, uint8_t b) {
+#if USE_LIGHTBAR
     if (g_handle < 0 || !scePadSetLightBar) return;
     MacroColor c = { r, g, b, 0 };
-    g_self_call = true; // tell our own hook not to swallow this
-    scePadSetLightBar(g_handle, &c);
-    g_self_call = false;
+    mlog("light bar: calling scePadSetLightBar");
+    s32 rr = scePadSetLightBar(g_handle, &c); // direct call, no hook on this function
+    mlog_hex("light bar: returned", (uint32_t)rr);
+#else
+    (void)r; (void)g; (void)b;
+#endif
 }
 
 static void apply_state_bar(void) {
@@ -223,17 +227,20 @@ static void apply_state_bar(void) {
     case ST_RECORD: set_bar(255, 0, 0); break;
     case ST_PLAY:   set_bar(0, 255, 0); break;
     default:
-        if (g_have_game_bar) {
-            set_bar(g_game_bar.r, g_game_bar.g, g_game_bar.b);
-        } else if (g_handle >= 0 && scePadResetLightBar) {
-            scePadResetLightBar(g_handle);
+#if USE_LIGHTBAR
+        if (g_handle >= 0 && scePadResetLightBar) {
+            mlog("light bar: calling scePadResetLightBar");
+            s32 rr = scePadResetLightBar(g_handle);
+            mlog_hex("light bar: returned", (uint32_t)rr);
         }
+#endif
         break;
     }
 }
 
 static void enter_state(MacroState s) {
     g_state = s;
+    mlog_dec("enter_state:", (uint32_t)s);
     apply_state_bar();
 }
 
@@ -324,6 +331,7 @@ static void strip_combo(PadHead *d) {
 /* ------------------------------------------------------------------ */
 
 static void start_record(uint64_t now) {
+    mlog("start_record: begin");
     g_len = 0;
     g_duration = 0;
     g_t0 = now;
@@ -450,15 +458,6 @@ s32 scePadRead_hook(s32 handle, void *data, s32 count) {
     return ret;
 }
 
-s32 scePadSetLightBar_hook(s32 handle, const MacroColor *color) {
-    if (!g_self_call && color) {
-        g_game_bar = *color; // remember what the game wants
-        g_have_game_bar = true;
-        if (g_state != ST_IDLE) return 0; // swallow while recording/playing
-    }
-    return HOOK_CONTINUE(scePadSetLightBar, s32 (*)(s32, const MacroColor *), handle, color);
-}
-
 /* ------------------------------------------------------------------ */
 /* Plugin entry points                                                 */
 /* ------------------------------------------------------------------ */
@@ -486,14 +485,14 @@ s32 attr_public plugin_load(s32 argc, const char* argv[]) {
 
     mlog_hex("found scePadReadState at:", (uint64_t)(uintptr_t)scePadReadState);
     mlog_hex("found scePadRead at:", (uint64_t)(uintptr_t)scePadRead);
-    mlog_hex("found scePadSetLightBar at:", (uint64_t)(uintptr_t)scePadSetLightBar);
+    mlog_hex("found scePadSetLightBar at (not hooked):", (uint64_t)(uintptr_t)scePadSetLightBar);
     mlog_hex("found scePadResetLightBar at:", (uint64_t)(uintptr_t)scePadResetLightBar);
 
     if (scePadReadState)   { HOOK32(scePadReadState);   mlog("hooked scePadReadState"); }
     if (scePadRead)        { HOOK32(scePadRead);        mlog("hooked scePadRead"); }
-    if (scePadSetLightBar) { HOOK32(scePadSetLightBar); mlog("hooked scePadSetLightBar"); }
 
     mlog("plugin_load finished, waiting for pad reads");
+    mlog_dec("light bar feedback enabled:", USE_LIGHTBAR);
     return 0;
 }
 
@@ -502,7 +501,6 @@ s32 attr_public plugin_unload(s32 argc, const char* argv[]) {
     g_state = ST_IDLE;
     if (scePadReadState)   { UNHOOK(scePadReadState); }
     if (scePadRead)        { UNHOOK(scePadRead); }
-    if (scePadSetLightBar) { UNHOOK(scePadSetLightBar); }
     return 0;
 }
 
