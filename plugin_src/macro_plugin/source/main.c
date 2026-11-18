@@ -1375,11 +1375,16 @@ _Static_assert(sizeof(MD_Param) == 0x80, "MD_Param size");
 #define MD_MAGIC            0xC0D1A109u
 #define MD_MODE_USER_MSG    1
 #define MD_BTN_OK           0
+#define MD_BTN_YESNO        1
 #define MD_BTN_TWO          9
 #define MD_STATUS_FINISHED  3
 #define GREET_LAST_PAGE     4
 
 enum { GR_DONE = 0, GR_PENDING, GR_RUNNING };
+// button styles for the dialog, tried in this order until the system accepts one
+enum { BM_TWO = 0, BM_YESNO = 1, BM_OK = 2 };
+static int      g_md_magic_mode = -1;  // 0 = checksum from the block size, 1 = from its address (-1 = not known yet)
+static int      g_md_btn_mode = -1;    // BM_* style that worked (-1 = not known yet)
 static int      g_gr_stage = GR_DONE;
 static int      g_gr_page = 0;
 static uint32_t g_gr_wait = 0;
@@ -1456,7 +1461,7 @@ static void seconds_text(char *out, size_t cap, uint32_t ms) {
     out[i] = 0;
 }
 
-static void greet_text(int page) {
+static void greet_text(int page, int btn_mode) {
     char c[64], hold[32];
     combo_name(g_cfg.combo_mask, c, sizeof(c));
     seconds_text(hold, sizeof(hold), g_cfg.hold_play_us / 1000u);
@@ -1467,7 +1472,7 @@ static void greet_text(int page) {
     case 1:
         i = put_s(o, 0, cap, "Welcome to Macro Plugin!\n\n");
         i = put_s(o, i, cap, "Record your controller inputs and replay them in a loop, in any game.\n\n");
-        i = put_s(o, i, cap, "Want a quick tour of the controls?");
+        i = put_s(o, i, cap, btn_mode == BM_OK ? "Press OK for a quick tour of the controls." : "Want a quick tour of the controls?");
         break;
     case 2:
         i = put_s(o, 0, cap, "THE BASICS\n\n");
@@ -1476,6 +1481,7 @@ static void greet_text(int page) {
         i = put_s(o, i, cap, "Tap it once more: stop.\n\n");
         i = put_s(o, i, cap, "Hold "); i = put_s(o, i, cap, c); i = put_s(o, i, cap, " for ");
         i = put_s(o, i, cap, hold); i = put_s(o, i, cap, ": play your saved macro.");
+        if (btn_mode == BM_YESNO) i = put_s(o, i, cap, "\n\n(Yes = next page, No = close)");
         break;
     case 3:
         i = put_s(o, 0, cap, "WHILE HOLDING "); i = put_s(o, i, cap, c); i = put_s(o, i, cap, "\n\n");
@@ -1485,6 +1491,7 @@ static void greet_text(int page) {
         i = put_s(o, i, cap, "CIRCLE: reload config.json\n");
         i = put_s(o, i, cap, "SQUARE: show this guide\n\n");
         i = put_s(o, i, cap, "These buttons never reach the game while you hold the combo.");
+        if (btn_mode == BM_YESNO) i = put_s(o, i, cap, "\n\n(Yes = next page, No = close)");
         break;
     default:
         i = put_s(o, 0, cap, "ALL SET\n\n");
@@ -1496,33 +1503,67 @@ static void greet_text(int page) {
     o[i] = 0;
 }
 
-static bool greet_open(int page) {
-    greet_text(page);
+// fills the dialog settings for one page using one (checksum style, button style) combination
+static void md_build(int page, int magic_mode, int btn_mode) {
+    greet_text(page, btn_mode);
     memset(&g_md_param, 0, sizeof(g_md_param));
     memset(&g_md_user, 0, sizeof(g_md_user));
     memset(&g_md_btns, 0, sizeof(g_md_btns));
     g_md_param.base.size = sizeof(MD_Base);
-    g_md_param.base.magic = (uint32_t)(MD_MAGIC + (uint64_t)(uintptr_t)&g_md_param.base);
+    g_md_param.base.magic = (uint32_t)(MD_MAGIC + (magic_mode == 0 ? (uint64_t)sizeof(MD_Base)
+                                                                    : (uint64_t)(uintptr_t)&g_md_param.base));
     g_md_param.size = sizeof(MD_Param);
     g_md_param.mode = MD_MODE_USER_MSG;
     g_md_param.userMsg = &g_md_user;
     g_md_user.msg = g_gr_text;
-    if (page >= GREET_LAST_PAGE) {
+    if (page >= GREET_LAST_PAGE || btn_mode == BM_OK) {
         g_md_user.buttonType = MD_BTN_OK;
+    } else if (btn_mode == BM_YESNO) {
+        g_md_user.buttonType = MD_BTN_YESNO;
     } else {
         g_md_user.buttonType = MD_BTN_TWO;
         g_md_user.buttons = &g_md_btns;
         g_md_btns.msg1 = (page == 1) ? "Yes" : "Next";
         g_md_btns.msg2 = (page == 1) ? "Skip" : "Done";
     }
+}
+
+// The first page that opens decides which combination works; later pages reuse it.
+static bool greet_open(int page) {
+    bool last = (page >= GREET_LAST_PAGE);
     // an "already initialized" answer from init is harmless, so only open's answer decides
     s32 r = p_mdInit();
     mlog_hex("welcome: dialog init returned", (uint32_t)r);
-    r = p_mdOpen(&g_md_param);
-    mlog_hex("welcome: dialog open returned", (uint32_t)r);
-    if (r < 0) { p_mdTerm(); return false; }
-    mlog_dec("welcome: showing page", page);
-    return true;
+    int attempts = 0;
+    for (int m = 0; m <= 1; m++) {
+        if (g_md_magic_mode >= 0 && m != g_md_magic_mode) continue;
+        for (int bm = BM_TWO; bm <= BM_OK; bm++) {
+            if (last) { if (bm != BM_OK) continue; }
+            else if (g_md_btn_mode >= 0 && bm != g_md_btn_mode) continue;
+            md_build(page, m, bm);
+            r = p_mdOpen(&g_md_param);
+            attempts++;
+            mlog_dec("welcome: open attempt, checksum style:", m);
+            mlog_dec("welcome:   button style (0 custom, 1 yes/no, 2 ok):", last ? BM_OK : bm);
+            mlog_hex("welcome:   open returned", (uint32_t)r);
+            if (r >= 0) {
+                g_md_magic_mode = m;
+                if (!last) g_md_btn_mode = bm;
+                mlog_dec("welcome: showing page", page);
+                return true;
+            }
+            p_mdTerm(); // reset, then try the next combination
+            p_mdInit();
+        }
+    }
+    mlog_dec("welcome: every attempt was rejected, attempts:", attempts);
+    {   // dump what we sent so a failure can be diagnosed from the log alone
+        const uint64_t *w = (const uint64_t *)&g_md_param;
+        for (size_t k = 0; k < sizeof(g_md_param) / 8; k++) mlog_hex("welcome: sent param word", w[k]);
+        const uint64_t *u = (const uint64_t *)&g_md_user;
+        for (size_t k = 0; k < sizeof(g_md_user) / 8; k++) mlog_hex("welcome: sent usermsg word", u[k]);
+    }
+    return false;
 }
 
 static void greet_finish(void) {
